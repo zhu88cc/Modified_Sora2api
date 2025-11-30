@@ -250,7 +250,7 @@ class SoraClient:
                     "kind": "sora"
                 }
             ],
-            "post_text": prompt
+            "post_text": ""
         }
 
         # 发布请求需要添加 sentinel token
