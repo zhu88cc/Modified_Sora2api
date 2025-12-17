@@ -50,7 +50,7 @@ Authorization: Bearer YOUR_API_KEY
 | `model` | string | | 模型 ID，默认 `sora-video-10s` |
 | `seconds` | string | | 时长: `"10"` 或 `"15"` |
 | `orientation` | string | | 方向: `"landscape"` 或 `"portrait"` |
-| `style_id` | string | | 风格: `festive`, `retro`, `news`, `selfie`, `handheld`, `anime` |
+| `style_id` | string | | 风格: `festive`, `retro`, `news`, `selfie`, `handheld`, `anime`, `comic`, `golden`, `vintage` |
 | `input_reference` | file | | 参考图片文件 (仅 form-data，用于图生视频) |
 | `input_image` | string | | Base64 编码的参考图片 (用于图生视频) |
 | `remix_target_id` | string | | Remix 视频 ID (如 `s_xxx`)，**仅支持与 prompt/model/seconds/orientation 配合使用** |
@@ -136,11 +136,14 @@ curl -X POST "http://localhost:8000/v1/videos" \
   "data": [
     {
       "url": "http://localhost:8000/tmp/video_xxx.mp4",
+      "permalink": "https://sora.chatgpt.com/p/s_xxx",
       "revised_prompt": "A cat walking in the garden"
     }
   ]
 }
 ```
+
+`data[0].permalink` 为该视频在 Sora 的分享页链接（如可获取到）。
 
 **错误:**
 

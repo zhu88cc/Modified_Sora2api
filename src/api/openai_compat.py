@@ -50,6 +50,50 @@ def _extract_url_from_chunks(chunks_data: list) -> Optional[str]:
     return None
 
 
+def _extract_video_info_from_chunks(chunks_data: list) -> dict:
+    """Extract video info (url/permalink) from streaming chunks.
+
+    Prefers parsing the structured JSON string produced by GenerationHandler,
+    and falls back to regex extraction when needed.
+    """
+    for chunk in chunks_data:
+        if chunk.startswith("data: ") and chunk != "data: [DONE]\n\n":
+            try:
+                data = json.loads(chunk[6:])
+                choices = data.get("choices", [])
+                if not choices:
+                    continue
+
+                delta = choices[0].get("delta", {})
+                content = delta.get("content")
+                if not content:
+                    continue
+
+                # Structured result content is a JSON string, e.g. {"type":"video","url":...}
+                try:
+                    structured = json.loads(content)
+                except Exception:
+                    structured = None
+
+                if isinstance(structured, dict) and structured.get("type") == "video":
+                    url = structured.get("url")
+                    permalink = structured.get("permalink")
+                    data_items = structured.get("data") or []
+                    if not url and data_items and isinstance(data_items[0], dict):
+                        url = data_items[0].get("url")
+                    if not permalink and data_items and isinstance(data_items[0], dict):
+                        permalink = data_items[0].get("permalink")
+                    return {"url": url, "permalink": permalink}
+
+                # Fallback: extract by regex
+                url_match = re.search(r'https?://[^\s\]"\']+', content)
+                if url_match:
+                    return {"url": url_match.group(0), "permalink": None}
+            except Exception:
+                pass
+    return {}
+
+
 def _extract_character_info(chunks_data: list) -> dict:
     """Extract character info from streaming chunks"""
     result = {}
@@ -90,7 +134,7 @@ async def create_video(
     model: str = Form("sora-video-10s", description="Model ID"),
     seconds: Optional[str] = Form(None, description="Duration: '10' or '15'"),
     orientation: Optional[str] = Form(None, description="Orientation: 'landscape' or 'portrait'"),
-    style_id: Optional[str] = Form(None, description="Video style: festive, retro, news, selfie, handheld, anime"),
+    style_id: Optional[str] = Form(None, description="Video style: festive, retro, news, selfie, handheld, anime, comic, golden, vintage"),
     input_reference: Optional[UploadFile] = File(None, description="Reference image file for image-to-video"),
     input_image: Optional[str] = Form(None, description="Base64 encoded reference image for image-to-video"),
     remix_target_id: Optional[str] = Form(None, description="Sora share link video ID for remix (e.g., s_xxx)"),
@@ -160,14 +204,16 @@ async def create_video(
             chunks.append(chunk)
         
         # Extract final URL
-        url = _extract_url_from_chunks(chunks)
+        video_info = _extract_video_info_from_chunks(chunks)
+        url = video_info.get("url") or _extract_url_from_chunks(chunks)
+        permalink = video_info.get("permalink")
         if url:
             return JSONResponse(content={
                 "id": f"video-{uuid.uuid4().hex[:24]}",
                 "object": "video",
                 "created": int(time.time()),
                 "model": final_model,
-                "data": [{"url": url, "revised_prompt": prompt}]
+                "data": [{"url": url, "permalink": permalink, "revised_prompt": prompt}]
             })
         else:
             raise HTTPException(status_code=500, detail="Video generation failed")

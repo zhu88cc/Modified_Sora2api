@@ -348,7 +348,7 @@ class SoraClient:
             orientation: Video orientation (portrait/landscape)
             media_id: Optional media ID for image-to-video
             n_frames: Number of frames (150=5s, 300=10s, 450=15s, 600=20s)
-            style_id: Optional style ID (festive, retro, news, selfie, handheld, anime)
+            style_id: Optional style ID (festive, retro, news, selfie, handheld, anime, comic, golden, vintage)
         """
         inpaint_items = []
         if media_id:

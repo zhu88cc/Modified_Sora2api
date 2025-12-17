@@ -256,7 +256,7 @@ class GenerationHandler:
             remix_target_id: Sora share link video ID for remix
             stream: Whether to stream response
             character_options: Optional character creation options
-            style_id: Optional video style (festive, retro, news, selfie, handheld, anime)
+            style_id: Optional video style (festive, retro, news, selfie, handheld, anime, comic, golden, vintage)
         """
         start_time = time.time()
 
@@ -590,6 +590,19 @@ class GenerationHandler:
                                 kind = item.get("kind")
                                 reason_str = item.get("reason_str") or item.get("markdown_reason_str")
                                 url = item.get("url") or item.get("downloadable_url")
+
+                                # Best-effort: derive permalink for the Sora post/share page.
+                                permalink = item.get("permalink")
+                                if not permalink:
+                                    post_id = item.get("post_id")
+                                    if not post_id:
+                                        attachment_id = item.get("id")
+                                        if isinstance(attachment_id, str) and "-attachment-" in attachment_id:
+                                            post_id = attachment_id.split("-attachment-", 1)[0]
+
+                                    if isinstance(post_id, str) and post_id.startswith("s_"):
+                                        permalink = f"https://sora.chatgpt.com/p/{post_id}"
+
                                 debug_logger.log_info(f"Found task {task_id} in drafts with kind: {kind}, reason_str: {reason_str}, has_url: {bool(url)}")
 
                                 # Check if content violates policy
@@ -672,6 +685,8 @@ class GenerationHandler:
 
                                         if not post_id:
                                             raise Exception("Failed to get post ID from publish API")
+
+                                        permalink = f"https://sora.chatgpt.com/p/{post_id}"
 
                                         # Get watermark-free video URL based on parse method
                                         if parse_method == "custom":
@@ -833,7 +848,8 @@ class GenerationHandler:
                                     yield self._format_stream_chunk(
                                         content=self._format_result_content(
                                             result_type="video",
-                                            url=local_url
+                                            url=local_url,
+                                            permalink=permalink
                                         ),
                                         finish_reason="STOP"
                                     )
@@ -1092,6 +1108,7 @@ class GenerationHandler:
         return f'data: {json.dumps(response, ensure_ascii=False)}\n\n'
 
     def _format_result_content(self, result_type: str, urls: list = None, url: str = None,
+                                permalink: str = None,
                                 username: str = None, display_name: str = None,
                                 cameo_id: str = None, character_id: str = None,
                                 error: str = None) -> str:
@@ -1120,9 +1137,11 @@ class GenerationHandler:
 
         elif result_type == "video":
             result["url"] = url
+            result["permalink"] = permalink
             # OpenAI Sora API compatible format
             result["data"] = [{
                 "url": url,
+                "permalink": permalink,
                 "revised_prompt": None
             }]
 

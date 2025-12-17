@@ -85,6 +85,9 @@ python main.py
 | 自拍 | `selfie` |
 | 手持 | `handheld` |
 | 动漫 | `anime` |
+| 漫画 | `comic` |
+| 金色 | `golden` |
+| 怀旧 | `vintage` |
 
 ---
 
