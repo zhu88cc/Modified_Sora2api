@@ -222,6 +222,10 @@ class SoraClient:
                     else:
                         error_msg = f"API request failed: {response.status_code} - {response.text}"
                     
+                    # Print error to console
+                    print(f"❌ [SoraClient] {method} {url} failed: {response.status_code}")
+                    print(f"   Response: {response.text[:500] if response.text else 'No response body'}")
+                    
                     debug_logger.log_error(
                         error_message=error_msg,
                         status_code=response.status_code,

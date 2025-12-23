@@ -86,7 +86,9 @@ class TokenManager:
             )
 
             if response.status_code != 200:
-                raise ValueError(f"Failed to get user info: {response.status_code}")
+                print(f"❌ [TokenManager] GET /me failed: {response.status_code}")
+                print(f"   Response: {response.text[:500] if response.text else 'No response body'}")
+                raise ValueError(f"Failed to get user info: {response.status_code} - {response.text[:200]}")
 
             return response.json()
 
