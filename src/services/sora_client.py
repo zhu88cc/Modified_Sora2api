@@ -96,8 +96,9 @@ class SoraClient:
     async def _make_request(self, method: str, endpoint: str, token: str,
                            json_data: Optional[Dict] = None,
                            multipart: Optional[Dict] = None,
-                           add_sentinel_token: bool = False) -> Dict[str, Any]:
-        """Make HTTP request with proxy support
+                           add_sentinel_token: bool = False,
+                           max_retries: int = 3) -> Dict[str, Any]:
+        """Make HTTP request with proxy support and 429 retry
 
         Args:
             method: HTTP method (GET/POST)
@@ -106,7 +107,10 @@ class SoraClient:
             json_data: JSON request body
             multipart: Multipart form data (for file uploads)
             add_sentinel_token: Whether to add openai-sentinel-token header (only for generation requests)
+            max_retries: Maximum number of retries for 429 errors
         """
+        import asyncio
+        
         proxy_url = await self.proxy_manager.get_proxy_url()
 
         headers = {
@@ -120,85 +124,112 @@ class SoraClient:
         if not multipart:
             headers["Content-Type"] = "application/json"
 
-        async with AsyncSession() as session:
-            url = f"{self.base_url}{endpoint}"
+        url = f"{self.base_url}{endpoint}"
+        
+        for attempt in range(max_retries + 1):
+            async with AsyncSession() as session:
+                kwargs = {
+                    "headers": headers,
+                    "timeout": self.timeout,
+                    "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
+                }
 
-            kwargs = {
-                "headers": headers,
-                "timeout": self.timeout,
-                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
-            }
+                if proxy_url:
+                    kwargs["proxy"] = proxy_url
 
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
+                if json_data:
+                    kwargs["json"] = json_data
 
-            if json_data:
-                kwargs["json"] = json_data
+                if multipart:
+                    kwargs["multipart"] = multipart
 
-            if multipart:
-                kwargs["multipart"] = multipart
-
-            # Log request
-            debug_logger.log_request(
-                method=method,
-                url=url,
-                headers=headers,
-                body=json_data,
-                files=multipart,
-                proxy=proxy_url
-            )
-
-            # Record start time
-            start_time = time.time()
-
-            # Make request
-            if method == "GET":
-                response = await session.get(url, **kwargs)
-            elif method == "POST":
-                response = await session.post(url, **kwargs)
-            else:
-                raise ValueError(f"Unsupported method: {method}")
-
-            # Calculate duration
-            duration_ms = (time.time() - start_time) * 1000
-
-            # Parse response
-            try:
-                response_json = response.json()
-            except:
-                response_json = None
-
-            # Log response
-            debug_logger.log_response(
-                status_code=response.status_code,
-                headers=dict(response.headers),
-                body=response_json if response_json else response.text,
-                duration_ms=duration_ms
-            )
-
-            # Check status
-            if response.status_code not in [200, 201]:
-                # Try to extract error message from response JSON
-                error_detail = None
-                if response_json and isinstance(response_json, dict):
-                    error_obj = response_json.get("error", {})
-                    if isinstance(error_obj, dict):
-                        error_detail = error_obj.get("message")
-                
-                # Use extracted error message or fall back to raw response
-                if error_detail:
-                    error_msg = f"{error_detail}"
-                else:
-                    error_msg = f"API request failed: {response.status_code} - {response.text}"
-                
-                debug_logger.log_error(
-                    error_message=error_msg,
-                    status_code=response.status_code,
-                    response_text=response.text
+                # Log request
+                debug_logger.log_request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    body=json_data,
+                    files=multipart,
+                    proxy=proxy_url
                 )
-                raise Exception(error_msg)
 
-            return response_json if response_json else response.json()
+                # Record start time
+                start_time = time.time()
+
+                # Make request
+                if method == "GET":
+                    response = await session.get(url, **kwargs)
+                elif method == "POST":
+                    response = await session.post(url, **kwargs)
+                else:
+                    raise ValueError(f"Unsupported method: {method}")
+
+                # Calculate duration
+                duration_ms = (time.time() - start_time) * 1000
+
+                # Parse response
+                try:
+                    response_json = response.json()
+                except:
+                    response_json = None
+
+                # Log response
+                debug_logger.log_response(
+                    status_code=response.status_code,
+                    headers=dict(response.headers),
+                    body=response_json if response_json else response.text,
+                    duration_ms=duration_ms
+                )
+
+                # Handle 429 rate limit with retry
+                if response.status_code == 429:
+                    if attempt < max_retries:
+                        # Get retry-after header or use exponential backoff
+                        retry_after = response.headers.get("Retry-After")
+                        if retry_after:
+                            try:
+                                wait_time = int(retry_after)
+                            except ValueError:
+                                wait_time = (attempt + 1) * 2  # 2, 4, 6 seconds
+                        else:
+                            wait_time = (attempt + 1) * 2  # Exponential backoff: 2, 4, 6 seconds
+                        
+                        print(f"⚠️ 429 Rate limit hit, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                        debug_logger.log_info(f"429 Rate limit, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        error_msg = f"Rate limit exceeded after {max_retries} retries"
+                        debug_logger.log_error(
+                            error_message=error_msg,
+                            status_code=429,
+                            response_text=response.text
+                        )
+                        raise Exception(error_msg)
+
+                # Check status
+                if response.status_code not in [200, 201]:
+                    # Try to extract error message from response JSON
+                    error_detail = None
+                    if response_json and isinstance(response_json, dict):
+                        error_obj = response_json.get("error", {})
+                        if isinstance(error_obj, dict):
+                            error_detail = error_obj.get("message")
+                    
+                    # Use extracted error message or fall back to raw response
+                    if error_detail:
+                        error_msg = f"{error_detail}"
+                    else:
+                        error_msg = f"API request failed: {response.status_code} - {response.text}"
+                    
+                    debug_logger.log_error(
+                        error_message=error_msg,
+                        status_code=response.status_code,
+                        response_text=response.text
+                    )
+                    raise Exception(error_msg)
+
+                return response_json if response_json else response.json()
     
     async def get_user_info(self, token: str) -> Dict[str, Any]:
         """Get user information"""
