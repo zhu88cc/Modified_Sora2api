@@ -1297,3 +1297,51 @@ async def clear_upload_logs(token: str = Depends(verify_admin_token)):
     
     await webdav_manager.clear_upload_logs()
     return {"success": True, "message": "All upload logs cleared"}
+
+
+# Proxy pool file endpoints
+@router.get("/api/proxy/pool")
+async def get_proxy_pool(token: str = Depends(verify_admin_token)):
+    """Get proxy pool content from data/proxy.txt"""
+    try:
+        import os
+        proxy_file = os.path.join("data", "proxy.txt")
+        if os.path.exists(proxy_file):
+            with open(proxy_file, "r", encoding="utf-8") as f:
+                content = f.read()
+        else:
+            content = ""
+        return {
+            "success": True,
+            "content": content
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read proxy pool: {str(e)}")
+
+@router.post("/api/proxy/pool")
+async def update_proxy_pool(
+    request: dict,
+    token: str = Depends(verify_admin_token)
+):
+    """Update proxy pool content in data/proxy.txt"""
+    try:
+        import os
+        content = request.get("content", "")
+        proxy_file = os.path.join("data", "proxy.txt")
+        
+        # Ensure data directory exists
+        os.makedirs("data", exist_ok=True)
+        
+        with open(proxy_file, "w", encoding="utf-8") as f:
+            f.write(content)
+        
+        # Reload proxy pool in proxy manager
+        if proxy_manager:
+            await proxy_manager.reload_proxy_pool()
+        
+        return {
+            "success": True,
+            "message": "Proxy pool updated successfully"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update proxy pool: {str(e)}")
