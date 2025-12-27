@@ -141,30 +141,7 @@ class SoraClient:
             except Exception as e:
                 print(f"⚠️ Cloudflare Solver API 调用失败: {e}")
         
-        # 如果 API 未配置或失败，尝试使用本地 DrissionPage
-        from concurrent.futures import ThreadPoolExecutor
-        
-        def solve_sync():
-            try:
-                from .cloudflare_solver import CloudflareSolver
-                
-                proxy = None
-                if proxy_url:
-                    proxy = proxy_url.replace("http://", "").replace("https://", "")
-                
-                solver = CloudflareSolver(proxy=proxy, headless=True, timeout=60)
-                solution = solver.solve("https://sora.chatgpt.com")
-                return {"cookies": solution.cookies, "user_agent": solution.user_agent}
-            except ImportError:
-                print("⚠️ DrissionPage 未安装，无法本地解决 Cloudflare challenge")
-                return None
-            except Exception as e:
-                print(f"⚠️ 本地 Cloudflare 解决失败: {e}")
-                return None
-        
-        loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor() as executor:
-            return await loop.run_in_executor(executor, solve_sync)
+        return None
 
     async def _make_request(self, method: str, endpoint: str, token: str,
                            json_data: Optional[Dict] = None,
