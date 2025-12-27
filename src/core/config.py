@@ -208,5 +208,28 @@ class Config:
             self._config["token_refresh"] = {}
         self._config["token_refresh"]["at_auto_refresh_enabled"] = enabled
 
+    # Cloudflare Solver 配置
+    @property
+    def cloudflare_solver_enabled(self) -> bool:
+        """Get Cloudflare solver enabled status"""
+        return self._config.get("cloudflare", {}).get("solver_enabled", False)
+
+    def set_cloudflare_solver_enabled(self, enabled: bool):
+        """Set Cloudflare solver enabled/disabled"""
+        if "cloudflare" not in self._config:
+            self._config["cloudflare"] = {}
+        self._config["cloudflare"]["solver_enabled"] = enabled
+
+    @property
+    def cloudflare_solver_api_url(self) -> str:
+        """Get Cloudflare solver API URL"""
+        return self._config.get("cloudflare", {}).get("solver_api_url", "http://localhost:8000/v1/challenge")
+
+    def set_cloudflare_solver_api_url(self, url: str):
+        """Set Cloudflare solver API URL"""
+        if "cloudflare" not in self._config:
+            self._config["cloudflare"] = {}
+        self._config["cloudflare"]["solver_api_url"] = url
+
 # Global config instance
 config = Config()

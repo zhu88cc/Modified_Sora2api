@@ -46,6 +46,12 @@ custom_parse_token = ""
 [token_refresh]
 at_auto_refresh_enabled = false
 
+[cloudflare]
+# Cloudflare Solver API 配置
+# 当检测到 429 Cloudflare challenge 时，自动请求此 API 获取 cf_clearance
+solver_enabled = false
+solver_api_url = "http://localhost:8000/v1/challenge"
+
 [webdav]
 webdav_enabled = false
 webdav_url = ""

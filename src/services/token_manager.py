@@ -20,6 +20,94 @@ class TokenManager:
         self._lock = asyncio.Lock()
         self.proxy_manager = ProxyManager(db)
         self.fake = Faker()
+        # 保存 Cloudflare 返回的 user_agent
+        self._cf_user_agent: Optional[str] = None
+    
+    async def _make_sora_request(
+        self,
+        session: AsyncSession,
+        method: str,
+        url: str,
+        headers: Dict[str, str],
+        proxy_url: Optional[str] = None,
+        json_data: Optional[Dict] = None,
+        max_cf_retries: int = 3,
+        **kwargs
+    ) -> Any:
+        """通用 Sora API 请求方法，自动处理 Cloudflare challenge
+        
+        Args:
+            session: AsyncSession 实例
+            method: HTTP 方法 (GET/POST)
+            url: 请求 URL
+            headers: 请求头
+            proxy_url: 代理 URL
+            json_data: JSON 请求体
+            max_cf_retries: Cloudflare challenge 最大重试次数
+            **kwargs: 其他请求参数
+        
+        Returns:
+            Response 对象
+        """
+        # 使用保存的 user_agent
+        if self._cf_user_agent and "User-Agent" not in headers:
+            headers["User-Agent"] = self._cf_user_agent
+        
+        request_kwargs = {
+            "headers": headers,
+            "timeout": 30,
+            "impersonate": "chrome",
+            **kwargs
+        }
+        
+        if proxy_url:
+            request_kwargs["proxy"] = proxy_url
+        
+        if json_data:
+            request_kwargs["json"] = json_data
+        
+        for attempt in range(max_cf_retries + 1):
+            if method.upper() == "GET":
+                response = await session.get(url, **request_kwargs)
+            elif method.upper() == "POST":
+                response = await session.post(url, **request_kwargs)
+            else:
+                raise ValueError(f"Unsupported method: {method}")
+            
+            # 检查是否是 Cloudflare challenge
+            if response.status_code == 429:
+                response_text = response.text[:1000] if response.text else ''
+                is_cf_challenge = (
+                    "Just a moment" in response_text or 
+                    "challenge-platform" in response_text or 
+                    "cf-mitigated" in str(response.headers)
+                )
+                
+                if is_cf_challenge and attempt < max_cf_retries:
+                    print(f"🔄 检测到 Cloudflare challenge (attempt {attempt + 1}/{max_cf_retries})，尝试解决...")
+                    cf_result = await self._solve_cloudflare(proxy_url)
+                    if cf_result:
+                        cf_cookies = cf_result.get("cookies", {})
+                        cf_user_agent = cf_result.get("user_agent")
+                        
+                        # 注入 cookies
+                        for name, value in cf_cookies.items():
+                            session.cookies.set(name, value, domain=".sora.chatgpt.com")
+                        
+                        # 更新 user_agent
+                        if cf_user_agent:
+                            self._cf_user_agent = cf_user_agent
+                            headers["User-Agent"] = cf_user_agent
+                            request_kwargs["headers"] = headers
+                            print(f"✅ Cloudflare cookies 和 User-Agent 已更新")
+                        else:
+                            print("✅ Cloudflare cookies 已注入")
+                        
+                        continue
+            
+            return response
+        
+        return response
     
     async def decode_jwt(self, token: str) -> dict:
         """Decode JWT token without verification"""
@@ -59,8 +147,13 @@ class TokenManager:
         # 转换为小写
         return format_choice.lower()
 
-    async def get_user_info(self, access_token: str) -> dict:
-        """Get user info from Sora API"""
+    async def get_user_info(self, access_token: str, retry_with_cf: bool = True) -> dict:
+        """Get user info from Sora API
+        
+        Args:
+            access_token: Access token
+            retry_with_cf: If True, retry with Cloudflare solver on challenge
+        """
         proxy_url = await self.proxy_manager.get_proxy_url()
 
         async with AsyncSession() as session:
@@ -71,28 +164,16 @@ class TokenManager:
                 "Referer": "https://sora.chatgpt.com/"
             }
 
-            kwargs = {
-                "headers": headers,
-                "timeout": 30,
-                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
-            }
-
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
-
-            response = await session.get(
-                f"{config.sora_base_url}/me",
-                **kwargs
+            response = await self._make_sora_request(
+                session, "GET", f"{config.sora_base_url}/me",
+                headers, proxy_url,
+                max_cf_retries=3 if retry_with_cf else 0
             )
 
             if response.status_code != 200:
                 response_text = response.text[:1000] if response.text else 'No response body'
                 print(f"❌ [TokenManager] GET /me failed: {response.status_code}")
-                print(f"   Response: {response_text}")
-                
-                # Check if it's Cloudflare challenge
-                if "Just a moment" in response_text or "challenge-platform" in response_text:
-                    raise ValueError(f"Cloudflare challenge detected (status {response.status_code}). Your proxy IP may be blocked.")
+                print(f"   Response: {response_text[:200]}")
                 
                 # Try to extract error message from JSON
                 try:
@@ -103,6 +184,64 @@ class TokenManager:
                     raise ValueError(f"{response.status_code} - {response_text[:500]}")
 
             return response.json()
+    
+    async def _solve_cloudflare(self, proxy_url: str = None) -> dict:
+        """解决 Cloudflare challenge
+        
+        优先使用配置的 Cloudflare Solver API，如果未配置则使用本地 DrissionPage
+        
+        Returns:
+            包含 cookies 和 user_agent 的字典
+        """
+        import httpx
+        from concurrent.futures import ThreadPoolExecutor
+        
+        # 优先使用配置的 Cloudflare Solver API
+        if config.cloudflare_solver_enabled and config.cloudflare_solver_api_url:
+            try:
+                api_url = config.cloudflare_solver_api_url
+                print(f"🔄 调用 Cloudflare Solver API: {api_url}")
+                
+                async with httpx.AsyncClient(timeout=120) as client:
+                    response = await client.get(api_url)
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        if data.get("success"):
+                            cookies = data.get("cookies", {})
+                            user_agent = data.get("user_agent")
+                            print(f"✅ Cloudflare Solver API 返回成功，耗时 {data.get('elapsed_seconds', 0):.2f}s")
+                            return {"cookies": cookies, "user_agent": user_agent}
+                        else:
+                            print(f"⚠️ Cloudflare Solver API 返回失败: {data.get('error')}")
+                    else:
+                        print(f"⚠️ Cloudflare Solver API 请求失败: {response.status_code}")
+                        
+            except Exception as e:
+                print(f"⚠️ Cloudflare Solver API 调用失败: {e}")
+        
+        # 如果 API 未配置或失败，尝试使用本地 DrissionPage
+        def solve_sync():
+            try:
+                from .cloudflare_solver import CloudflareSolver
+                
+                proxy = None
+                if proxy_url:
+                    proxy = proxy_url.replace("http://", "").replace("https://", "")
+                
+                solver = CloudflareSolver(proxy=proxy, headless=True, timeout=60)
+                solution = solver.solve("https://sora.chatgpt.com")
+                return {"cookies": solution.cookies, "user_agent": solution.user_agent}
+            except ImportError:
+                print("⚠️ DrissionPage 未安装，无法本地解决 Cloudflare challenge")
+                return None
+            except Exception as e:
+                print(f"⚠️ 本地 Cloudflare 解决失败: {e}")
+                return None
+        
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as executor:
+            return await loop.run_in_executor(executor, solve_sync)
 
     async def get_subscription_info(self, token: str) -> Dict[str, Any]:
         """Get subscription information from Sora API
@@ -118,25 +257,17 @@ class TokenManager:
         proxy_url = await self.proxy_manager.get_proxy_url()
 
         headers = {
-            "Authorization": f"Bearer {token}"
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Origin": "https://sora.chatgpt.com",
+            "Referer": "https://sora.chatgpt.com/"
         }
 
         async with AsyncSession() as session:
             url = "https://sora.chatgpt.com/backend/billing/subscriptions"
             print(f"📡 请求 URL: {url}")
-            print(f"🔑 使用 Token: {token[:30]}...")
 
-            kwargs = {
-                "headers": headers,
-                "timeout": 30,
-                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
-            }
-
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
-                print(f"🌐 使用代理: {proxy_url}")
-
-            response = await session.get(url, **kwargs)
+            response = await self._make_sora_request(session, "GET", url, headers, proxy_url)
             print(f"📥 响应状态码: {response.status_code}")
 
             if response.status_code == 200:
@@ -186,22 +317,15 @@ class TokenManager:
         async with AsyncSession() as session:
             headers = {
                 "Authorization": f"Bearer {access_token}",
-                "Accept": "application/json"
+                "Accept": "application/json",
+                "Origin": "https://sora.chatgpt.com",
+                "Referer": "https://sora.chatgpt.com/"
             }
 
-            kwargs = {
-                "headers": headers,
-                "timeout": 30,
-                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
-            }
-
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
-                print(f"🌐 使用代理: {proxy_url}")
-
-            response = await session.get(
+            response = await self._make_sora_request(
+                session, "GET",
                 "https://sora.chatgpt.com/backend/project_y/invite/mine",
-                **kwargs
+                headers, proxy_url
             )
 
             print(f"📥 响应状态码: {response.status_code}")
@@ -235,9 +359,10 @@ class TokenManager:
 
                         # Try to activate Sora2
                         try:
-                            activate_response = await session.get(
+                            activate_response = await self._make_sora_request(
+                                session, "GET",
                                 "https://sora.chatgpt.com/backend/m/bootstrap",
-                                **kwargs
+                                headers, proxy_url
                             )
 
                             if activate_response.status_code == 200:
@@ -294,22 +419,15 @@ class TokenManager:
         async with AsyncSession() as session:
             headers = {
                 "Authorization": f"Bearer {access_token}",
-                "Accept": "application/json"
+                "Accept": "application/json",
+                "Origin": "https://sora.chatgpt.com",
+                "Referer": "https://sora.chatgpt.com/"
             }
 
-            kwargs = {
-                "headers": headers,
-                "timeout": 30,
-                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
-            }
-
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
-                print(f"🌐 使用代理: {proxy_url}")
-
-            response = await session.get(
+            response = await self._make_sora_request(
+                session, "GET",
                 "https://sora.chatgpt.com/backend/nf/check",
-                **kwargs
+                headers, proxy_url
             )
 
             print(f"📥 响应状态码: {response.status_code}")
@@ -351,23 +469,16 @@ class TokenManager:
         async with AsyncSession() as session:
             headers = {
                 "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
+                "Origin": "https://sora.chatgpt.com",
+                "Referer": "https://sora.chatgpt.com/"
             }
 
-            kwargs = {
-                "headers": headers,
-                "json": {"username": username},
-                "timeout": 30,
-                "impersonate": "chrome"
-            }
-
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
-                print(f"🌐 使用代理: {proxy_url}")
-
-            response = await session.post(
+            response = await self._make_sora_request(
+                session, "POST",
                 "https://sora.chatgpt.com/backend/project_y/profile/username/check",
-                **kwargs
+                headers, proxy_url,
+                json_data={"username": username}
             )
 
             print(f"📥 响应状态码: {response.status_code}")
@@ -399,23 +510,16 @@ class TokenManager:
         async with AsyncSession() as session:
             headers = {
                 "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
+                "Origin": "https://sora.chatgpt.com",
+                "Referer": "https://sora.chatgpt.com/"
             }
 
-            kwargs = {
-                "headers": headers,
-                "json": {"username": username},
-                "timeout": 30,
-                "impersonate": "chrome"
-            }
-
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
-                print(f"🌐 使用代理: {proxy_url}")
-
-            response = await session.post(
+            response = await self._make_sora_request(
+                session, "POST",
                 "https://sora.chatgpt.com/backend/project_y/profile/username/set",
-                **kwargs
+                headers, proxy_url,
+                json_data={"username": username}
             )
 
             print(f"📥 响应状态码: {response.status_code}")
@@ -441,29 +545,22 @@ class TokenManager:
             # 生成设备ID
             device_id = str(uuid.uuid4())
 
-            # 只设置必要的头，让 impersonate 处理其他
             headers = {
-                "authorization": f"Bearer {access_token}",
-                "cookie": f"oai-did={device_id}"
+                "Authorization": f"Bearer {access_token}",
+                "Cookie": f"oai-did={device_id}",
+                "Content-Type": "application/json",
+                "Origin": "https://sora.chatgpt.com",
+                "Referer": "https://sora.chatgpt.com/"
             }
 
             print(f"🆔 设备ID: {device_id}")
             print(f"📦 请求体: {{'invite_code': '{invite_code}'}}")
 
-            kwargs = {
-                "headers": headers,
-                "json": {"invite_code": invite_code},
-                "timeout": 30,
-                "impersonate": "chrome120"  # 使用 chrome120 让库自动处理 UA 等头
-            }
-
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
-                print(f"🌐 使用代理: {proxy_url}")
-
-            response = await session.post(
+            response = await self._make_sora_request(
+                session, "POST",
                 "https://sora.chatgpt.com/backend/project_y/invite/accept",
-                **kwargs
+                headers, proxy_url,
+                json_data={"invite_code": invite_code}
             )
 
             print(f"📥 响应状态码: {response.status_code}")
@@ -493,21 +590,11 @@ class TokenManager:
                 "Referer": "https://sora.chatgpt.com/"
             }
 
-            kwargs = {
-                "headers": headers,
-                "timeout": 30,
-                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
-            }
-
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
-                debug_logger.log_info(f"[ST_TO_AT] 使用代理: {proxy_url}")
-
             url = "https://sora.chatgpt.com/api/auth/session"
             debug_logger.log_info(f"[ST_TO_AT] 📡 请求 URL: {url}")
 
             try:
-                response = await session.get(url, **kwargs)
+                response = await self._make_sora_request(session, "GET", url, headers, proxy_url)
                 debug_logger.log_info(f"[ST_TO_AT] 📥 响应状态码: {response.status_code}")
 
                 if response.status_code != 200:

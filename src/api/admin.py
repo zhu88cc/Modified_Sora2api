@@ -141,6 +141,10 @@ class UpdateWatermarkFreeConfigRequest(BaseModel):
     custom_parse_url: Optional[str] = None
     custom_parse_token: Optional[str] = None
 
+class UpdateCloudflareSolverConfigRequest(BaseModel):
+    solver_enabled: bool
+    solver_api_url: Optional[str] = None
+
 # Auth endpoints
 @router.post("/api/login", response_model=LoginResponse)
 async def login(request: LoginRequest):
@@ -595,6 +599,35 @@ async def update_watermark_free_config(
         config.set_watermark_free_enabled(request.watermark_free_enabled)
 
         return {"success": True, "message": "Watermark-free mode configuration updated"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# Cloudflare Solver config endpoints
+@router.get("/api/cloudflare/config")
+async def get_cloudflare_solver_config(token: str = Depends(verify_admin_token)) -> dict:
+    """Get Cloudflare Solver configuration"""
+    from ..core.config import config
+    return {
+        "success": True,
+        "config": {
+            "solver_enabled": config.cloudflare_solver_enabled,
+            "solver_api_url": config.cloudflare_solver_api_url
+        }
+    }
+
+@router.post("/api/cloudflare/config")
+async def update_cloudflare_solver_config(
+    request: UpdateCloudflareSolverConfigRequest,
+    token: str = Depends(verify_admin_token)
+):
+    """Update Cloudflare Solver configuration"""
+    try:
+        from ..core.config import config
+        config.set_cloudflare_solver_enabled(request.solver_enabled)
+        if request.solver_api_url:
+            config.set_cloudflare_solver_api_url(request.solver_api_url)
+        
+        return {"success": True, "message": "Cloudflare Solver configuration updated"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
