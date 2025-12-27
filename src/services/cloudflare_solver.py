@@ -173,7 +173,7 @@ def get_cloudflare_state() -> CloudflareState:
 
 
 async def solve_cloudflare_challenge(
-    proxy_url: Optional[str] = None, max_retries: int = 3
+    proxy_url: Optional[str] = None, max_retries: int = 1
 ) -> Optional[Dict[str, Any]]:
     """解决 Cloudflare challenge 并更新全局状态
     
@@ -188,6 +188,7 @@ async def solve_cloudflare_challenge(
         包含 cookies 和 user_agent 的字典，如 {"cookies": {...}, "user_agent": "..."}
         失败返回 None
     """
+    import concurrent.futures
     from curl_cffi.requests import Session
     
     if not config.cloudflare_solver_enabled or not config.cloudflare_solver_api_url:
@@ -197,26 +198,37 @@ async def solve_cloudflare_challenge(
     api_url = config.cloudflare_solver_api_url
     
     def _sync_request():
-        """同步请求函数，在线程池中执行"""
+        """同步请求函数，在独立线程中执行"""
         try:
-            # 使用 curl_cffi 的同步 Session，设置超时
-            sess = Session(impersonate="chrome110", timeout=30)
+            print(f"🔄 [线程] 开始请求 Cloudflare Solver API: {api_url}")
+            # 使用 curl_cffi 的同步 Session，设置较短的超时
+            sess = Session(impersonate="chrome110", timeout=15)
             response = sess.get(api_url)
+            print(f"🔄 [线程] 请求完成，状态码: {response.status_code}")
             return response
         except Exception as e:
-            print(f"⚠️ Cloudflare Solver API 请求异常: {e}")
+            print(f"⚠️ [线程] Cloudflare Solver API 请求异常: {type(e).__name__}: {e}")
             return None
     
     for attempt in range(1, max_retries + 1):
         try:
             print(f"🔄 调用 Cloudflare Solver API: {api_url} (尝试 {attempt}/{max_retries})")
             
-            # 使用 asyncio.to_thread 在线程池中执行同步请求，避免阻塞事件循环
-            response = await asyncio.to_thread(_sync_request)
+            # 使用 ThreadPoolExecutor 确保在独立线程中执行
+            loop = asyncio.get_event_loop()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                try:
+                    # 设置 20 秒超时
+                    response = await asyncio.wait_for(
+                        loop.run_in_executor(executor, _sync_request),
+                        timeout=20
+                    )
+                except asyncio.TimeoutError:
+                    print(f"⚠️ Cloudflare Solver API 请求超时 (20秒)")
+                    return None
             
             if response is None:
                 print(f"⚠️ Cloudflare Solver API 请求失败")
-                # 连接失败时不重试，直接返回
                 return None
             
             if response.status_code == 200:
@@ -238,15 +250,15 @@ async def solve_cloudflare_challenge(
                 print(f"⚠️ Cloudflare Solver API 请求失败: {response.status_code}")
         
         except Exception as e:
-            print(f"⚠️ Cloudflare Solver API 调用失败: {e}")
+            print(f"⚠️ Cloudflare Solver API 调用失败: {type(e).__name__}: {e}")
         
         # 如果不是最后一次尝试，等待后重试
         if attempt < max_retries:
-            wait_time = attempt * 2
+            wait_time = 2
             print(f"⏳ 等待 {wait_time}s 后重试...")
             await asyncio.sleep(wait_time)
     
-    print(f"❌ Cloudflare Solver API 调用失败，已重试 {max_retries} 次")
+    print(f"❌ Cloudflare Solver API 调用失败")
     return None
 
 

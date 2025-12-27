@@ -658,7 +658,6 @@ async def get_cloudflare_state(token: str = Depends(verify_admin_token)) -> dict
 @router.post("/api/cloudflare/refresh")
 async def refresh_cloudflare_credentials(token: str = Depends(verify_admin_token)) -> dict:
     """Manually refresh Cloudflare credentials"""
-    import asyncio
     from ..services.cloudflare_solver import solve_cloudflare_challenge, get_cloudflare_state
     from ..core.config import config
     
@@ -676,11 +675,7 @@ async def refresh_cloudflare_credentials(token: str = Depends(verify_admin_token
         }
     
     try:
-        # 设置超时，避免无限等待（缩短到60秒，因为连接超时已经是10秒）
-        result = await asyncio.wait_for(
-            solve_cloudflare_challenge(),
-            timeout=60
-        )
+        result = await solve_cloudflare_challenge()
         if result:
             cf_state = get_cloudflare_state()
             return {
@@ -693,11 +688,6 @@ async def refresh_cloudflare_credentials(token: str = Depends(verify_admin_token
                 "success": False,
                 "message": "获取凭据失败，请检查 Solver 服务是否正常运行，或 API 地址是否正确"
             }
-    except asyncio.TimeoutError:
-        return {
-            "success": False,
-            "message": "获取凭据超时，请检查 Solver 服务是否正常运行"
-        }
     except Exception as e:
         return {
             "success": False,
