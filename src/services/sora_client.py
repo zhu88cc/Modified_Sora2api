@@ -235,6 +235,9 @@ class SoraClient:
                     response.text
                 )
                 
+                # 如果启用了 CF solver，所有 429/403 都尝试获取 CF 凭据（因为 Sora 的 429/403 通常就是 CF 限制）
+                should_try_cf = config.cf_enabled and response.status_code in [429, 403]
+                
                 # If CF challenge detected but CF solver is disabled, limit retries
                 if is_cf and not config.cf_enabled:
                     cf_retry_count += 1
@@ -254,8 +257,8 @@ class SoraClient:
                         attempt += 1
                         continue
                 
-                # If Cloudflare challenge, try to refresh credentials (but not too frequently)
-                if is_cf and config.cf_enabled:
+                # If CF solver enabled and got 429, try to refresh credentials
+                if should_try_cf:
                     # Only refresh if we haven't already tried in this request cycle
                     if not cf_refresh_attempted:
                         # Check if another request is already refreshing CF credentials
@@ -265,7 +268,7 @@ class SoraClient:
                             attempt += 1
                             continue
                         
-                        print(f"🔄 检测到 CF challenge ({response.status_code})，获取凭据...")
+                        print(f"🔄 检测到 {response.status_code}，获取 CF 凭据...")
                         cf_state.invalidate()  # Mark as invalid first
                         
                         try:
@@ -307,12 +310,12 @@ class SoraClient:
                         # Already tried refreshing CF credentials, just retry with existing ones
                         if attempt < max_retries:
                             wait_time = min((attempt + 1) * 3, 30) + random.uniform(0.5, 1.5)
-                            print(f"⚠️ CF challenge 持续，{wait_time:.1f}秒后重试")
+                            print(f"⚠️ 429 持续（已尝试 CF），{wait_time:.1f}秒后重试")
                             await asyncio.sleep(wait_time)
                             attempt += 1
                             continue
                 
-                # 429 retry logic
+                # 429 retry logic (CF solver disabled or not applicable)
                 if response.status_code == 429 and attempt < max_retries:
                     # Get retry-after header or use exponential backoff
                     retry_after = response.headers.get("Retry-After")
@@ -326,9 +329,8 @@ class SoraClient:
                     # Add small jitter to spread retries
                     wait_time += random.uniform(0.2, 0.8)
                     
-                    cf_msg = " (CF)" if is_cf else ""
-                    print(f"⚠️ 429 速率限制{cf_msg}，{wait_time:.0f}秒后重试 ({attempt + 1}/{max_retries})")
-                    debug_logger.log_info(f"429 rate limit{cf_msg}, retry after {wait_time}s ({attempt + 1}/{max_retries})")
+                    print(f"⚠️ 429 速率限制，{wait_time:.0f}秒后重试 ({attempt + 1}/{max_retries})")
+                    debug_logger.log_info(f"429 rate limit, retry after {wait_time}s ({attempt + 1}/{max_retries})")
                     await asyncio.sleep(wait_time)
                     attempt += 1
                     continue
