@@ -205,6 +205,9 @@ async def solve_cloudflare_challenge(
         return None
     
     api_url = config.cloudflare_solver_api_url
+    # 自动补全 /v1/challenge 路径
+    if not api_url.endswith('/v1/challenge'):
+        api_url = api_url.rstrip('/') + '/v1/challenge'
     
     def _sync_request():
         """同步请求函数，在独立线程中执行，使用标准库"""
