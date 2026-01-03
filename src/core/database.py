@@ -266,197 +266,153 @@ class Database:
 
     async def check_and_migrate_db(self, config_dict: dict = None):
         """Check database integrity and perform migrations if needed
-
-        Args:
-            config_dict: Configuration dictionary from setting.toml (optional)
-                        Used to initialize new tables with values from setting.toml
+        
+        使用版本号机制，只在版本变化时执行完整迁移检查
         """
+        CURRENT_DB_VERSION = 5  # 增加此版本号以触发迁移
+        
         db = await self._get_connection()
         try:
-            # Check and add missing columns to tokens table
-            if await self._table_exists(db, "tokens"):
-                columns_to_add = [
-                    ("sora2_supported", "BOOLEAN"),
-                    ("sora2_invite_code", "TEXT"),
-                    ("sora2_redeemed_count", "INTEGER DEFAULT 0"),
-                    ("sora2_total_count", "INTEGER DEFAULT 0"),
-                    ("sora2_remaining_count", "INTEGER DEFAULT 0"),
-                    ("sora2_cooldown_until", "TIMESTAMP"),
-                    ("image_enabled", "BOOLEAN DEFAULT 1"),
-                    ("video_enabled", "BOOLEAN DEFAULT 1"),
-                    ("image_concurrency", "INTEGER DEFAULT -1"),
-                    ("video_concurrency", "INTEGER DEFAULT -1"),
-                    ("client_id", "TEXT"),
-                    ("proxy_url", "TEXT"),
-                ]
-
-                for col_name, col_type in columns_to_add:
-                    if not await self._column_exists(db, "tokens", col_name):
-                        try:
-                            await db.execute(f"ALTER TABLE tokens ADD COLUMN {col_name} {col_type}")
-                            print(f"  �?Added column '{col_name}' to tokens table")
-                        except Exception as e:
-                            print(f"  �?Failed to add column '{col_name}': {e}")
-
-            # Check and add missing columns to token_stats table
-            if await self._table_exists(db, "token_stats"):
-                columns_to_add = [
-                    ("consecutive_error_count", "INTEGER DEFAULT 0"),
-                ]
-
-                for col_name, col_type in columns_to_add:
-                    if not await self._column_exists(db, "token_stats", col_name):
-                        try:
-                            await db.execute(f"ALTER TABLE token_stats ADD COLUMN {col_name} {col_type}")
-                            print(f"  �?Added column '{col_name}' to token_stats table")
-                        except Exception as e:
-                            print(f"  �?Failed to add column '{col_name}': {e}")
-
-            # Check and add missing columns to admin_config table
-            if await self._table_exists(db, "admin_config"):
-                columns_to_add = [
-                    ("admin_username", "TEXT DEFAULT 'admin'"),
-                    ("admin_password", "TEXT DEFAULT 'admin'"),
-                ]
-
-                for col_name, col_type in columns_to_add:
-                    if not await self._column_exists(db, "admin_config", col_name):
-                        try:
-                            await db.execute(f"ALTER TABLE admin_config ADD COLUMN {col_name} {col_type}")
-                            print(f"  �?Added column '{col_name}' to admin_config table")
-                        except Exception as e:
-                            print(f"  �?Failed to add column '{col_name}': {e}")
-
-            # Check and add missing columns to watermark_free_config table
-            if await self._table_exists(db, "watermark_free_config"):
-                columns_to_add = [
-                    ("parse_method", "TEXT DEFAULT 'third_party'"),
-                    ("custom_parse_url", "TEXT"),
-                    ("custom_parse_token", "TEXT"),
-                ]
-
-                for col_name, col_type in columns_to_add:
-                    if not await self._column_exists(db, "watermark_free_config", col_name):
-                        try:
-                            await db.execute(f"ALTER TABLE watermark_free_config ADD COLUMN {col_name} {col_type}")
-                            print(f"  �?Added column '{col_name}' to watermark_free_config table")
-                        except Exception as e:
-                            print(f"  �?Failed to add column '{col_name}': {e}")
-
-            # Check and add missing columns to proxy_config table
-            if await self._table_exists(db, "proxy_config"):
-                columns_to_add = [
-                    ("proxy_pool_enabled", "BOOLEAN DEFAULT 0"),
-                ]
-
-                for col_name, col_type in columns_to_add:
-                    if not await self._column_exists(db, "proxy_config", col_name):
-                        try:
-                            await db.execute(f"ALTER TABLE proxy_config ADD COLUMN {col_name} {col_type}")
-                            print(f"  �?Added column '{col_name}' to proxy_config table")
-                        except Exception as e:
-                            print(f"  �?Failed to add column '{col_name}': {e}")
-
-            # Check and add missing columns to request_logs table
-            if await self._table_exists(db, "request_logs"):
-                columns_to_add = [
-                    ("task_id", "TEXT"),
-                    ("updated_at", "TIMESTAMP"),
-                ]
-
-                for col_name, col_type in columns_to_add:
-                    if not await self._column_exists(db, "request_logs", col_name):
-                        try:
-                            await db.execute(f"ALTER TABLE request_logs ADD COLUMN {col_name} {col_type}")
-                            print(f"  �?Added column '{col_name}' to request_logs table")
-                        except Exception as e:
-                            print(f"  �?Failed to add column '{col_name}': {e}")
-
-            # Ensure all config tables have their default rows
-            # Pass config_dict if available to initialize from setting.toml
-            await self._ensure_config_rows(db, config_dict)
-
-            # Create new tables if they don't exist (for migration)
-            if not await self._table_exists(db, "cloudflare_solver_config"):
+            # 检查版本表是否存在
+            if not await self._table_exists(db, "db_version"):
                 await db.execute("""
-                    CREATE TABLE IF NOT EXISTS cloudflare_solver_config (
+                    CREATE TABLE db_version (
                         id INTEGER PRIMARY KEY DEFAULT 1,
-                        solver_enabled BOOLEAN DEFAULT 0,
-                        solver_api_url TEXT DEFAULT 'http://localhost:8000/v1/challenge',
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        version INTEGER DEFAULT 1,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
-                print("  �?Created cloudflare_solver_config table")
-                # Initialize with values from setting.toml
-                if config_dict:
-                    cloudflare_config = config_dict.get("cloudflare", {})
-                    solver_enabled = cloudflare_config.get("solver_enabled", False)
-                    solver_api_url = cloudflare_config.get("solver_api_url", "http://localhost:8000/v1/challenge")
-                    await db.execute("""
-                        INSERT INTO cloudflare_solver_config (id, solver_enabled, solver_api_url)
-                        VALUES (1, ?, ?)
-                    """, (solver_enabled, solver_api_url))
-
-            if not await self._table_exists(db, "webdav_config"):
-                await db.execute("""
-                    CREATE TABLE IF NOT EXISTS webdav_config (
-                        id INTEGER PRIMARY KEY DEFAULT 1,
-                        webdav_enabled BOOLEAN DEFAULT 0,
-                        webdav_url TEXT,
-                        webdav_username TEXT,
-                        webdav_password TEXT,
-                        webdav_upload_path TEXT DEFAULT '/video',
-                        auto_delete_enabled BOOLEAN DEFAULT 0,
-                        auto_delete_days INTEGER DEFAULT 30,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-                print("  �?Created webdav_config table")
-
-            if not await self._table_exists(db, "video_records"):
-                await db.execute("""
-                    CREATE TABLE IF NOT EXISTS video_records (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        task_id TEXT NOT NULL,
-                        token_id INTEGER NOT NULL,
-                        original_url TEXT NOT NULL,
-                        watermark_free_url TEXT,
-                        webdav_path TEXT,
-                        webdav_url TEXT,
-                        file_size INTEGER,
-                        status TEXT DEFAULT 'pending',
-                        error_message TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        uploaded_at TIMESTAMP,
-                        deleted_at TIMESTAMP,
-                        FOREIGN KEY (token_id) REFERENCES tokens(id)
-                    )
-                """)
-                await db.execute("CREATE INDEX IF NOT EXISTS idx_video_record_task_id ON video_records(task_id)")
-                await db.execute("CREATE INDEX IF NOT EXISTS idx_video_record_status ON video_records(status)")
-                print("  �?Created video_records table")
-
-            if not await self._table_exists(db, "upload_logs"):
-                await db.execute("""
-                    CREATE TABLE IF NOT EXISTS upload_logs (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        video_record_id INTEGER,
-                        operation TEXT NOT NULL,
-                        status TEXT NOT NULL,
-                        message TEXT,
-                        duration FLOAT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (video_record_id) REFERENCES video_records(id)
-                    )
-                """)
-                await db.execute("CREATE INDEX IF NOT EXISTS idx_upload_log_video_record_id ON upload_logs(video_record_id)")
-                print("  �?Created upload_logs table")
-
+                await db.execute("INSERT INTO db_version (id, version) VALUES (1, 1)")
+                await db.commit()
+            
+            # 获取当前版本
+            cursor = await db.execute("SELECT version FROM db_version WHERE id = 1")
+            row = await cursor.fetchone()
+            db_version = row[0] if row else 1
+            
+            # 如果版本相同，跳过迁移检查
+            if db_version >= CURRENT_DB_VERSION:
+                await self._ensure_config_rows(db, config_dict)
+                await db.commit()
+                return
+            
+            # 执行迁移
+            await self._run_migrations(db, db_version, CURRENT_DB_VERSION, config_dict)
+            
+            # 更新版本号
+            await db.execute("UPDATE db_version SET version = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1", 
+                           (CURRENT_DB_VERSION,))
             await db.commit()
         finally:
             await db.close()
+
+    async def _run_migrations(self, db, from_version: int, to_version: int, config_dict: dict = None):
+        """执行数据库迁移"""
+        print(f"  📦 Migrating database from v{from_version} to v{to_version}...")
+        
+        # 快速批量添加列（不逐个检查）
+        migrations = [
+            # (表名, 列名, 类型)
+            ("tokens", "sora2_supported", "BOOLEAN"),
+            ("tokens", "sora2_invite_code", "TEXT"),
+            ("tokens", "sora2_redeemed_count", "INTEGER DEFAULT 0"),
+            ("tokens", "sora2_total_count", "INTEGER DEFAULT 0"),
+            ("tokens", "sora2_remaining_count", "INTEGER DEFAULT 0"),
+            ("tokens", "sora2_cooldown_until", "TIMESTAMP"),
+            ("tokens", "image_enabled", "BOOLEAN DEFAULT 1"),
+            ("tokens", "video_enabled", "BOOLEAN DEFAULT 1"),
+            ("tokens", "image_concurrency", "INTEGER DEFAULT -1"),
+            ("tokens", "video_concurrency", "INTEGER DEFAULT -1"),
+            ("tokens", "client_id", "TEXT"),
+            ("tokens", "proxy_url", "TEXT"),
+            ("token_stats", "consecutive_error_count", "INTEGER DEFAULT 0"),
+            ("admin_config", "admin_username", "TEXT DEFAULT 'admin'"),
+            ("admin_config", "admin_password", "TEXT DEFAULT 'admin'"),
+            ("watermark_free_config", "parse_method", "TEXT DEFAULT 'third_party'"),
+            ("watermark_free_config", "custom_parse_url", "TEXT"),
+            ("watermark_free_config", "custom_parse_token", "TEXT"),
+            ("proxy_config", "proxy_pool_enabled", "BOOLEAN DEFAULT 0"),
+            ("request_logs", "task_id", "TEXT"),
+            ("request_logs", "updated_at", "TIMESTAMP"),
+        ]
+        
+        for table, col, col_type in migrations:
+            if await self._table_exists(db, table):
+                try:
+                    await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+                except:
+                    pass  # 列已存在，忽略
+        
+        # 创建新表
+        new_tables = [
+            ("cloudflare_solver_config", """
+                CREATE TABLE IF NOT EXISTS cloudflare_solver_config (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    solver_enabled BOOLEAN DEFAULT 0,
+                    solver_api_url TEXT DEFAULT 'http://localhost:8000/v1/challenge',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """),
+            ("webdav_config", """
+                CREATE TABLE IF NOT EXISTS webdav_config (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    webdav_enabled BOOLEAN DEFAULT 0,
+                    webdav_url TEXT,
+                    webdav_username TEXT,
+                    webdav_password TEXT,
+                    webdav_upload_path TEXT DEFAULT '/video',
+                    auto_delete_enabled BOOLEAN DEFAULT 0,
+                    auto_delete_days INTEGER DEFAULT 30,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """),
+            ("video_records", """
+                CREATE TABLE IF NOT EXISTS video_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    token_id INTEGER NOT NULL,
+                    original_url TEXT NOT NULL,
+                    watermark_free_url TEXT,
+                    webdav_path TEXT,
+                    webdav_url TEXT,
+                    file_size INTEGER,
+                    status TEXT DEFAULT 'pending',
+                    error_message TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    uploaded_at TIMESTAMP,
+                    deleted_at TIMESTAMP,
+                    FOREIGN KEY (token_id) REFERENCES tokens(id)
+                )
+            """),
+            ("upload_logs", """
+                CREATE TABLE IF NOT EXISTS upload_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    video_record_id INTEGER,
+                    operation TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    message TEXT,
+                    duration FLOAT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (video_record_id) REFERENCES video_records(id)
+                )
+            """),
+        ]
+        
+        for table_name, create_sql in new_tables:
+            if not await self._table_exists(db, table_name):
+                await db.execute(create_sql)
+        
+        # 创建索引
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_video_record_task_id ON video_records(task_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_video_record_status ON video_records(status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_upload_log_video_record_id ON upload_logs(video_record_id)")
+        
+        # 确保配置行存在
+        await self._ensure_config_rows(db, config_dict)
+        
+        print(f"  ✓ Migration completed")
 
     async def init_db(self):
         """Initialize database tables - creates all tables and ensures data integrity"""

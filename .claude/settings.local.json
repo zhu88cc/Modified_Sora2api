@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(git add -A)",
-      "Bash(git commit -m \"$\\(cat <<''EOF''\n修复: Sora2激活重试时kwargs未定义的bug\n\n修复get_sora2_invite_code函数中，激活Sora2后重新获取邀请码时\n使用了未定义的kwargs变量，导致NameError异常，使Sora2状态\n在\"支持\"和\"不支持\"之间跳动。\n\n🤖 Generated with [Claude Code]\\(https://claude.com/claude-code\\)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")"
-    ]
-  }
-}
