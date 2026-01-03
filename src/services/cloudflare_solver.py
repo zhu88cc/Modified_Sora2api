@@ -157,42 +157,32 @@ class CloudflareState:
 
 # Global per-token state
 _cf_states: Dict[str, CloudflareState] = {}
-_cf_solving_locks: Dict[str, asyncio.Lock] = {}
-_cf_refreshing: Dict[str, bool] = {}  # Flag indicating if refresh is in progress
+_cf_solving_lock: asyncio.Lock = None  # 全局单一锁
+_cf_refreshing: bool = False  # 全局刷新标记
 
 MIN_CF_REFRESH_INTERVAL = 30  # seconds
 
 
-def _state_key(token_id: Optional[int], token: Optional[str]) -> str:
-    if token_id is not None:
-        return f"token_id:{token_id}"
-    if token:
-        return f"token:{token}"
-    return "global"
+def _get_global_lock() -> asyncio.Lock:
+    """获取全局 CF 解决锁"""
+    global _cf_solving_lock
+    if _cf_solving_lock is None:
+        _cf_solving_lock = asyncio.Lock()
+    return _cf_solving_lock
 
 
 def is_cf_refreshing(token_id: Optional[int] = None, token: Optional[str] = None) -> bool:
     """Check if another request is refreshing CF credentials"""
-    key = _state_key(token_id, token)
-    return _cf_refreshing.get(key, False)
+    return _cf_refreshing
 
 
 def get_cloudflare_state(token_id: Optional[int] = None, token: Optional[str] = None) -> CloudflareState:
-    """Get Cloudflare state manager for a token or fallback to global"""
-    key = _state_key(token_id, token)
-    state = _cf_states.get(key)
-    if state is None:
-        state = CloudflareState()
-        _cf_states[key] = state
-    return state
-
-
-def _get_solving_lock(key: str) -> asyncio.Lock:
-    lock = _cf_solving_locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _cf_solving_locks[key] = lock
-    return lock
+    """Get Cloudflare state manager - 使用全局状态"""
+    # 使用全局状态，不按 token 分开
+    global _cf_states
+    if "global" not in _cf_states:
+        _cf_states["global"] = CloudflareState()
+    return _cf_states["global"]
 
 
 async def solve_cloudflare_challenge(
@@ -202,12 +192,9 @@ async def solve_cloudflare_challenge(
 ) -> Optional[Dict[str, Any]]:
     """Solve Cloudflare challenge and update global state
     
-    Prevents concurrent calls: if a request is already solving the challenge,
-    other requests will wait for the result instead of making duplicate calls.
-    
-    Args:
-        timeout: Maximum time to wait for CF Solver response (default 30s)
+    使用全局锁防止并发调用：如果有请求正在获取凭据，其他请求会等待结果。
     """
+    global _cf_refreshing
     import concurrent.futures
     import urllib.request
     import json
@@ -217,26 +204,29 @@ async def solve_cloudflare_challenge(
         print("⚠️ Cloudflare Solver API 未配置或未启用")
         return None
     
-    key = _state_key(token_id, token)
-    cf_state = get_cloudflare_state(token_id=token_id, token=token)
-    lock = _get_solving_lock(key)
+    cf_state = get_cloudflare_state()
+    lock = _get_global_lock()
 
-    # 检查是否有其他请求正在刷新，如果是则静默等待
+    # 检查是否有其他请求正在刷新
     is_waiting = lock.locked()
     if is_waiting:
         print(f"⏳ 等待其他请求获取 CF 凭据...")
     
-    # Use lock to prevent concurrent CF Solver calls
+    # 使用全局锁防止并发 CF Solver 调用
     async with lock:
-        # If credentials are still valid and not force refresh, return directly
+        # 如果凭据仍然有效且不是强制刷新，直接返回
         if not force_refresh and cf_state.is_valid:
-            # 如果是等待后获得凭据，静默返回；否则显示复用日志
             if not is_waiting:
                 print("✅ 使用现有有效的 Cloudflare 凭据")
             return {"cookies": cf_state.cookies, "user_agent": cf_state.user_agent}
         
+        # 如果是等待后进入，再次检查凭据是否已被其他请求更新
+        if is_waiting and cf_state.is_valid:
+            print("✅ 其他请求已获取 CF 凭据")
+            return {"cookies": cf_state.cookies, "user_agent": cf_state.user_agent}
+        
         # 标记正在刷新
-        _cf_refreshing[key] = True
+        _cf_refreshing = True
         
         try:
             refresh_msg = "（强制刷新）" if force_refresh else ""
@@ -248,7 +238,6 @@ async def solve_cloudflare_challenge(
             if force_refresh:
                 api_url = f"{api_url}?skip_cache=true"
             
-            # Use the timeout parameter for socket timeout
             socket_timeout = timeout
             
             def _sync_request():
@@ -279,7 +268,7 @@ async def solve_cloudflare_challenge(
                         try:
                             result = await asyncio.wait_for(
                                 loop.run_in_executor(executor, _sync_request),
-                                timeout=timeout + 5  # Add 5s buffer for async overhead
+                                timeout=timeout + 5
                             )
                         except asyncio.TimeoutError:
                             print(f"⚠️ CF Solver 请求超时 ({timeout}秒)")
@@ -313,8 +302,7 @@ async def solve_cloudflare_challenge(
             print("❌ CF 凭据获取失败")
             return None
         finally:
-            # 无论成功失败都清除刷新标记
-            _cf_refreshing[key] = False
+            _cf_refreshing = False
 
 
 def is_cloudflare_challenge(status_code: int, headers: dict, response_text: str) -> bool:
