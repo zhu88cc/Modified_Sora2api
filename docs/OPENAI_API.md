@@ -51,7 +51,7 @@ Authorization: Bearer YOUR_API_KEY
 
 ## POST /v1/videos
 
-生成视频（默认异步模式）。
+生成视频。
 
 ### 请求参数
 
@@ -65,11 +65,11 @@ Authorization: Bearer YOUR_API_KEY
 | `input_reference` | file | | 参考图片文件 (仅 form-data，用于图生视频) |
 | `input_image` | string | | Base64 编码的参考图片 (用于图生视频) |
 | `remix_target_id` | string | | Remix 视频 ID (如 `s_xxx`)，**仅支持与 prompt/model/seconds/orientation 配合使用** |
-| `async_mode` | boolean | | 异步模式，默认 `true`。设为 `false` 则等待生成完成 |
+| `async_mode` | boolean | | 异步模式，默认 `false`。设为 `true` 则立即返回任务ID |
 
-> **异步模式（默认）**: 立即返回 `video_id` 和 `status="processing"`，通过 `GET /v1/videos/{video_id}` 轮询状态
+> **同步模式（默认）**: 等待生成完成后返回结果，包含视频 URL
 >
-> **同步模式**: 设置 `async_mode=false`，等待生成完成后返回结果
+> **异步模式**: 设置 `async_mode=true`，立即返回 `video_id` 和 `status="processing"`，通过 `GET /v1/videos/{video_id}` 轮询状态
 >
 > **使用角色**: 在 `prompt` 中使用 `@username` 引用已创建的角色，例如 `"@my_cat walking in the park"`
 > 

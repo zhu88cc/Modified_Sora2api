@@ -522,21 +522,21 @@ async def create_video(
     input_image: Optional[str] = Form(None, description="Base64 encoded reference image"),
     remix_target_id: Optional[str] = Form(None, description="Remix target video ID"),
     metadata: Optional[str] = Form(None, description="Extended parameters (JSON string)"),
-    async_mode: Optional[bool] = Form(True, description="Async mode: return immediately with task ID (default: true)"),
+    async_mode: Optional[bool] = Form(False, description="Async mode: return immediately with task ID"),
     api_key: str = Depends(verify_api_key_header)
 ):
     """Create video generation (OpenAI Sora Compatible)
     
     Supports both multipart/form-data and JSON body.
     
-    **Async Mode (default, async_mode=true):**
+    **Sync Mode (default):**
+    - Waits for generation to complete
+    - Returns final result with url
+    
+    **Async Mode (async_mode=true):**
     - Returns immediately with video_id and status="processing"
     - Poll GET /v1/videos/{video_id} to check status
     - Download via GET /v1/videos/{video_id}/content when completed
-    
-    **Sync Mode (async_mode=false):**
-    - Waits for generation to complete
-    - Returns final result with url
     """
     try:
         # Check if JSON body
