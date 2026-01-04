@@ -641,7 +641,7 @@ async def create_video(
             ))
             _video_tasks[video_id] = bg_task
             
-            # Return immediately with processing status
+            # Return immediately with processing status (OpenAI Sora format)
             return JSONResponse(
                 status_code=201,
                 content={
@@ -649,12 +649,8 @@ async def create_video(
                     "object": "video",
                     "model": model,
                     "created_at": created_at,
-                    "status": "processing",
-                    "progress": 0,
+                    "status": "in_progress",
                     "expires_at": created_at + 86400,
-                    "size": final_size,
-                    "seconds": duration,
-                    "quality": "standard"
                 }
             )
         
@@ -684,14 +680,14 @@ async def create_video(
                     "object": "video",
                     "model": model,
                     "created_at": created_at,
-                    "status": "succeeded",
-                    "progress": 100,
+                    "status": "completed",
                     "expires_at": created_at + 86400,  # 24 hours
-                    "size": final_size,
-                    "seconds": duration,
-                    "quality": "standard",
-                    "url": url,
-                    "permalink": permalink
+                    "output": {
+                        "url": url,
+                        "width": int(final_size.split('x')[0]) if 'x' in final_size else 1920,
+                        "height": int(final_size.split('x')[1]) if 'x' in final_size else 1080,
+                        "duration_seconds": int(duration)
+                    }
                 }
             )
         else:
@@ -759,23 +755,29 @@ async def get_video(
     elif "10s" in task.model:
         duration = "10"
     
+    # Map internal status to OpenAI Sora status
+    openai_status = status
+    if status == "succeeded":
+        openai_status = "completed"
+    elif status == "processing":
+        openai_status = "in_progress"
+    
     response = {
         "id": video_id,
         "object": "video",
         "model": task.model,
         "created_at": created_at,
-        "status": status,
-        "progress": int(task.progress) if task.progress else 0,
+        "status": openai_status,
         "expires_at": created_at + 86400,
-        "size": size,
-        "seconds": duration,
-        "quality": "standard",
-        "remixed_from_video_id": None,
-        "error": None
     }
     
-    if task.result_urls:
-        response["url"] = task.result_urls
+    if openai_status == "completed" and task.result_urls:
+        response["output"] = {
+            "url": task.result_urls,
+            "width": width,
+            "height": height,
+            "duration_seconds": int(duration)
+        }
     
     if task.error_message:
         response["error"] = {
