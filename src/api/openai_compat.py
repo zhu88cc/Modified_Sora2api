@@ -237,6 +237,8 @@ async def create_chat_completion(
         # Handle streaming
         if request.stream:
             async def generate():
+                has_error = False
+                error_message = None
                 try:
                     async for chunk in generation_handler.handle_generation(
                         model=request.model,
@@ -252,19 +254,30 @@ async def create_chat_completion(
                     # Client disconnected, clean exit
                     pass
                 except Exception as e:
-                    # Return OpenAI-compatible error format
+                    has_error = True
+                    error_message = str(e)
                     import traceback
                     traceback.print_exc()
-                    error_response = {
-                        "error": {
-                            "message": str(e),
-                            "type": "server_error",
-                            "param": None,
-                            "code": None
-                        }
+                
+                # If error occurred, send OpenAI-compatible error in stream format
+                if has_error:
+                    error_chunk = {
+                        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": request.model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "content": json.dumps({
+                                    "type": "error",
+                                    "error": error_message
+                                })
+                            },
+                            "finish_reason": "stop"
+                        }]
                     }
-                    error_chunk = f'data: {json.dumps(error_response)}\n\n'
-                    yield error_chunk
+                    yield f'data: {json.dumps(error_chunk)}\n\n'
                     yield 'data: [DONE]\n\n'
 
             return StreamingResponse(
