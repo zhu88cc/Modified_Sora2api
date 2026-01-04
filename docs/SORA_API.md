@@ -55,7 +55,7 @@ Sora2API 实现了智能的自适应轮询机制，根据视频生成进度动�
 
 ### POST /v1/videos
 
-创建视频生成任务，支持文生视频和图生视频。
+创建视频生成任务，支持文生视频和图生视频。**默认异步模式**。
 
 #### 请求头
 
@@ -77,17 +77,17 @@ Sora2API 实现了智能的自适应轮询机制，根据视频生成进度动�
 | input_reference | file | 否 | 参考图片文件（图生视频，仅 multipart/form-data） |
 | input_image | string | 否 | Base64 编码的参考图片 |
 | remix_target_id | string | 否 | 混剪源视频ID（如 `s_xxx`） |
-| async_mode | boolean | 否 | 异步模式，默认 `false`。设为 `true` 时立即返回任务ID |
+| async_mode | boolean | 否 | 异步模式，默认 `true`。设为 `false` 时等待生成完成 |
 | metadata | string | 否 | 扩展参数（JSON字符串） |
 
-#### 同步模式（默认）
+#### 异步模式（默认）
 
-等待视频生成完成后返回结果。
+立即返回任务ID，通过 `GET /v1/videos/{video_id}` 轮询状态。
 
 **请求示例：**
 
 ```bash
-# 文生视频
+# 文生视频（异步）
 curl -X POST "http://localhost:8000/v1/videos" \
   -H "Authorization: Bearer sk-xxxx" \
   -H "Content-Type: application/json" \
@@ -115,20 +115,18 @@ curl -X POST "http://localhost:8000/v1/videos" \
   "object": "video",
   "model": "sora-2",
   "created_at": 1703145600,
-  "status": "succeeded",
-  "progress": 100,
+  "status": "processing",
+  "progress": 0,
   "expires_at": 1703232000,
   "size": "1920x1080",
   "seconds": "10",
-  "quality": "standard",
-  "url": "https://videos.sora.com/xxx/video.mp4",
-  "permalink": "https://sora.chatgpt.com/p/s_xxx"
+  "quality": "standard"
 }
 ```
 
-#### 异步模式
+#### 同步模式
 
-设置 `async_mode=true` 时，立即返回任务ID，通过轮询查询状态。
+设置 `async_mode=false` 时，等待生成完成后返回结果。
 
 **请求示例：**
 
@@ -140,7 +138,7 @@ curl -X POST "http://localhost:8000/v1/videos" \
     "prompt": "一只猫咪在草地上奔跑",
     "model": "sora-2",
     "seconds": "10",
-    "async_mode": true
+    "async_mode": false
   }'
 ```
 
