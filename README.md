@@ -123,9 +123,22 @@ ip:port:user:pass
 ## API 文档
 
 详细 API 文档请参考：
-- [OpenAI 标准格式 API](docs/OPENAI_API.md) - 包含批量操作 API
-- [Sora API](docs/SORA_API.md) - 包含自适应轮询机制说明
-- [性能优化指南](docs/PERFORMANCE_OPTIMIZATION.md) - 性能优化配置
+- [v1 接口文档](docs/API_V1_DOCUMENTATION.md) - 完整的 v1 API 接口文档
+
+### 主要接口
+
+| 接口 | 方法 | 描述 |
+|------|------|------|
+| `/v1/models` | GET | 获取可用模型列表 |
+| `/v1/chat/completions` | POST | 统一聊天补全接口（支持流式） |
+| `/v1/videos` | POST | 创建视频生成任务 |
+| `/v1/videos/{id}` | GET | 获取视频任务状态 |
+| `/v1/images/generations` | POST | 图片生成 |
+| `/v1/characters` | POST | 角色创建 |
+| `/v1/stats` | GET | 系统统计 |
+| `/v1/feed` | GET | 公共 Feed |
+| `/api/tokens` | GET/POST | Token 管理 |
+| `/api/login` | POST | 管理员登录 |
 
 ---
 
