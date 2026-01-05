@@ -693,7 +693,7 @@ async def create_video(
         
         # Generate task ID
         video_id = f"{model}-{uuid.uuid4().hex[:12]}"
-        created_at = int(time.time() * 1000)
+        created_at = int(time.time())  # Unix timestamp in seconds
         
         # Async mode: create task and return immediately
         if async_mode:
@@ -708,7 +708,7 @@ async def create_video(
                 token_id=0,  # Will be set by generation handler
                 model=final_model,
                 prompt=prompt,
-                status="queued",
+                status="processing",
                 progress=0.0
             )
             await db.create_task(task)
@@ -724,7 +724,7 @@ async def create_video(
                 "image": image_data,
                 "remix_target_id": remix_target_id,
                 "style_id": style_id,
-                "status": "queued",
+                "status": "processing",
                 "progress": 0,
                 "created_at": created_at,
                 "result_url": None,
@@ -734,14 +734,14 @@ async def create_video(
             # Start background task
             bg_task = asyncio.create_task(_process_video_generation_v2(video_id))
             
-            # Return immediately with queued status
+            # Return immediately with processing status
             return JSONResponse(
                 status_code=201,
                 content={
                     "id": video_id,
                     "object": "video",
                     "model": model,
-                    "status": "queued",
+                    "status": "processing",
                     "progress": 0,
                     "created_at": created_at,
                     "seconds": str(duration),
@@ -772,13 +772,13 @@ async def create_video(
                     "id": video_id,
                     "object": "video",
                     "model": model,
-                    "status": "completed",
+                    "status": "succeeded",
                     "progress": 100,
                     "created_at": created_at,
-                    "completed_at": int(time.time() * 1000),
+                    "completed_at": int(time.time()),
                     "seconds": str(duration),
                     "size": size,
-                    "result_url": url,
+                    "url": url,
                 }
             )
         else:
@@ -817,11 +817,20 @@ async def get_video(
     # First check in-memory tasks
     task_info = _video_tasks.get(video_id)
     if task_info and isinstance(task_info, dict):
+        # Map internal status to OpenAI Sora API status
+        status = task_info["status"]
+        if status == "queued":
+            status = "processing"
+        elif status == "in_progress":
+            status = "processing"
+        elif status == "completed":
+            status = "succeeded"
+        
         response = {
             "id": task_info["id"],
             "object": "video",
             "model": task_info["model"],
-            "status": task_info["status"],
+            "status": status,
             "progress": task_info["progress"],
             "created_at": task_info["created_at"],
             "seconds": task_info["seconds"],
@@ -830,6 +839,9 @@ async def get_video(
         
         if task_info.get("completed_at"):
             response["completed_at"] = task_info["completed_at"]
+        
+        if task_info.get("result_url"):
+            response["url"] = task_info["result_url"]
         
         if task_info.get("error"):
             response["error"] = task_info["error"]
@@ -844,12 +856,16 @@ async def get_video(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     
-    created_at = int(task.created_at.timestamp() * 1000) if task.created_at else int(time.time() * 1000)
+    created_at = int(task.created_at.timestamp()) if task.created_at else int(time.time())
     
-    # Map internal status
+    # Map internal status to OpenAI Sora API status
     status = task.status
-    if status == "processing":
-        status = "in_progress"
+    if status == "queued":
+        status = "processing"
+    elif status == "in_progress":
+        status = "processing"
+    elif status == "completed":
+        status = "succeeded"
     
     # Extract model info from task
     model = "sora-2"
@@ -879,12 +895,12 @@ async def get_video(
     }
     
     if task.status == "completed" and task.completed_at:
-        response["completed_at"] = int(task.completed_at.timestamp() * 1000)
+        response["completed_at"] = int(task.completed_at.timestamp())
     
     if task.error_message:
         response["error"] = {
             "message": task.error_message,
-            "code": "generation_failed"
+            "type": "server_error"
         }
     
     return JSONResponse(content=response)
