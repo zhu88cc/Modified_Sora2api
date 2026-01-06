@@ -981,6 +981,7 @@ async def get_stats(token: str = Depends(verify_admin_token)):
 
     # Backfill missing stats rows for legacy/imported tokens
     await db.ensure_token_stats_rows()
+    await db.cleanup_stale_tasks()
     stats = await db.get_stats()
     inflight = await db.get_inflight_counts()
 

@@ -1290,15 +1290,55 @@ class Database:
                 "today_errors": 0
             }
 
+    async def cleanup_stale_tasks(self, image_timeout: Optional[int] = None, video_timeout: Optional[int] = None):
+        """Mark stale in-progress tasks as failed based on timeout"""
+        from datetime import datetime, timedelta
+        image_timeout = image_timeout if image_timeout is not None else config.image_timeout
+        video_timeout = video_timeout if video_timeout is not None else config.video_timeout
+        cutoff_image = (datetime.now() - timedelta(seconds=image_timeout)).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff_video = (datetime.now() - timedelta(seconds=video_timeout)).strftime("%Y-%m-%d %H:%M:%S")
+
+        async with self._connect() as db:
+            await db.execute("""
+                UPDATE tasks
+                SET status = 'failed',
+                    error_message = COALESCE(error_message, 'Stale in_progress timeout'),
+                    completed_at = CURRENT_TIMESTAMP
+                WHERE status IN ('processing','in_progress')
+                  AND (
+                        (model LIKE 'sora-video%' AND created_at < ?)
+                     OR (model NOT LIKE 'sora-video%' AND created_at < ?)
+                  )
+            """, (cutoff_video, cutoff_image))
+            await db.commit()
+
     async def get_inflight_counts(self) -> dict:
         """Get current in-flight task counts by request interface type"""
+        from datetime import datetime, timedelta
+        cutoff_image = (datetime.now() - timedelta(seconds=config.image_timeout)).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff_video = (datetime.now() - timedelta(seconds=config.video_timeout)).strftime("%Y-%m-%d %H:%M:%S")
+
         async with self._connect() as db:
             cursor = await db.execute("""
                 SELECT 
-                    SUM(CASE WHEN status IN ('processing','in_progress') AND task_id LIKE 'task_%' THEN 1 ELSE 0 END) as chat_inflight,
-                    SUM(CASE WHEN status IN ('processing','in_progress') AND task_id NOT LIKE 'task_%' THEN 1 ELSE 0 END) as video_inflight
+                    SUM(CASE 
+                        WHEN status IN ('processing','in_progress')
+                             AND task_id LIKE 'task_%'
+                             AND (
+                                    (model LIKE 'sora-video%' AND created_at >= ?)
+                                 OR (model NOT LIKE 'sora-video%' AND created_at >= ?)
+                                 )
+                        THEN 1 ELSE 0 END) as chat_inflight,
+                    SUM(CASE 
+                        WHEN status IN ('processing','in_progress')
+                             AND task_id NOT LIKE 'task_%'
+                             AND (
+                                    (model LIKE 'sora-video%' AND created_at >= ?)
+                                 OR (model NOT LIKE 'sora-video%' AND created_at >= ?)
+                                 )
+                        THEN 1 ELSE 0 END) as video_inflight
                 FROM tasks
-            """)
+            """, (cutoff_video, cutoff_image, cutoff_video, cutoff_image))
             row = await cursor.fetchone()
             if row:
                 if isinstance(row, dict):
