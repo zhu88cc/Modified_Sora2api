@@ -25,14 +25,9 @@ class ProxyManager:
         Also handles 'st5 ' prefix format.
         """
         import re
-        # First, handle 'st5 ' prefix format by splitting on 'st5 ' or 'st5:'
-        # e.g., "st5 ip:port:user:passst5 ip:port:user:pass"
-        text = re.sub(r'(?i)st5\s+', 'socks5://', text)  # Replace 'st5 ' with 'socks5://'
-        text = re.sub(r'(?i)st5:', 'socks5://', text)    # Replace 'st5:' with 'socks5://'
-        
-        # Split by protocol prefixes, keeping the delimiter
-        # This handles: socks5://...socks5://... or http://...socks5://...
-        parts = re.split(r'(?=(?:https?|socks5h?)://)', text)
+        # Split by protocol prefixes or 'st5 ' prefix, keeping the delimiter
+        # This handles: socks5://...socks5://... or http://...socks5://... or st5 ...st5 ...
+        parts = re.split(r'(?=https?://)|(?=socks5h?://)|(?=(?i)st5\s+)', text)
         result = []
         for part in parts:
             part = part.strip()
@@ -69,11 +64,28 @@ class ProxyManager:
         - socks5://user:pass@host:port
         - socks5h://user:pass@host:port
         - socks5://host:port:user:pass (协议://IP:端口:用户名:密码)
+        - st5 host:port:user:pass (st5简写格式)
         - host:port (assumes http, no auth)
         - host:port:user:pass (IP:端口:用户名:密码 format, assumes http)
         """
+        import re
         line = line.strip()
         if not line:
+            return None
+        
+        # Handle st5 prefix format: "st5 ip:port:user:pass" -> "socks5://user:pass@ip:port"
+        st5_match = re.match(r'^(?i)st5\s+(.+)$', line)
+        if st5_match:
+            rest = st5_match.group(1)
+            parts = rest.split(":")
+            if len(parts) >= 4:
+                host = parts[0]
+                port = parts[1]
+                user = parts[2]
+                password = ":".join(parts[3:])
+                if port.isdigit():
+                    return f"socks5://{user}:{password}@{host}:{port}"
+            print(f"⚠️ Invalid st5 proxy format: {line}")
             return None
         
         # Check if it's a URL format with protocol
