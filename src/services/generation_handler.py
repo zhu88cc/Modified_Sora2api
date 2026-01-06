@@ -127,6 +127,7 @@ class AdaptivePoller:
 
 # Model configuration
 MODEL_CONFIG = {
+    # Image models
     "sora-image": {
         "type": "image",
         "width": 360,
@@ -195,6 +196,64 @@ MODEL_CONFIG = {
         "n_frames": 750,
         "model": "sy_8",
         "size": "small"
+    },
+    # Sora2 aliases (same as sora-video-*)
+    "sora2-10s": {
+        "type": "video",
+        "orientation": "landscape",
+        "n_frames": 300
+    },
+    "sora2-landscape-10s": {
+        "type": "video",
+        "orientation": "landscape",
+        "n_frames": 300
+    },
+    "sora2-portrait-10s": {
+        "type": "video",
+        "orientation": "portrait",
+        "n_frames": 300
+    },
+    "sora2-15s": {
+        "type": "video",
+        "orientation": "landscape",
+        "n_frames": 450
+    },
+    "sora2-landscape-15s": {
+        "type": "video",
+        "orientation": "landscape",
+        "n_frames": 450
+    },
+    "sora2-portrait-15s": {
+        "type": "video",
+        "orientation": "portrait",
+        "n_frames": 450
+    },
+    "sora2-25s": {
+        "type": "video",
+        "orientation": "landscape",
+        "n_frames": 750,
+        "model": "sy_8",
+        "size": "small"
+    },
+    "sora2-landscape-25s": {
+        "type": "video",
+        "orientation": "landscape",
+        "n_frames": 750,
+        "model": "sy_8",
+        "size": "small"
+    },
+    "sora2-portrait-25s": {
+        "type": "video",
+        "orientation": "portrait",
+        "n_frames": 750,
+        "model": "sy_8",
+        "size": "small"
+    },
+    # Simple sora-2 alias (default to 10s landscape)
+    "sora-2": {
+        "type": "video",
+        "orientation": "landscape",
+        "n_frames": 300
     }
 }
 
