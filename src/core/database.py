@@ -1296,31 +1296,42 @@ class Database:
         today = str(date.today())
         
         if self.db_type == "mysql":
-            # MySQL: use SELECT FOR UPDATE to lock the row, then update
-            import aiomysql
-            pool = await self._get_mysql_pool()
-            async with pool.acquire() as conn:
-                async with conn.cursor() as cursor:
-                    # Lock the row first
-                    await cursor.execute(
-                        "SELECT id FROM token_stats WHERE token_id = %s FOR UPDATE",
-                        (token_id,)
-                    )
-                    row = await cursor.fetchone()
-                    if not row:
-                        await cursor.execute(
-                            "INSERT INTO token_stats (token_id) VALUES (%s)",
-                            (token_id,)
-                        )
-                    # Now update atomically
-                    await cursor.execute("""
-                        UPDATE token_stats
-                        SET image_count = image_count + 1,
-                            today_image_count = IF(today_date = %s, today_image_count + 1, 1),
-                            today_date = %s
-                        WHERE token_id = %s
-                    """, (today, today, token_id))
-                    await conn.commit()
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    # MySQL: use SELECT FOR UPDATE to lock the row, then update
+                    import aiomysql
+                    pool = await self._get_mysql_pool()
+                    async with pool.acquire() as conn:
+                        async with conn.cursor() as cursor:
+                            # Lock the row first
+                            await cursor.execute(
+                                "SELECT id FROM token_stats WHERE token_id = %s FOR UPDATE",
+                                (token_id,)
+                            )
+                            row = await cursor.fetchone()
+                            if not row:
+                                await cursor.execute(
+                                    "INSERT INTO token_stats (token_id) VALUES (%s)",
+                                    (token_id,)
+                                )
+                            # Now update atomically
+                            await cursor.execute("""
+                                UPDATE token_stats
+                                SET image_count = image_count + 1,
+                                    today_image_count = IF(today_date = %s, today_image_count + 1, 1),
+                                    today_date = %s
+                                WHERE token_id = %s
+                            """, (today, today, token_id))
+                            await conn.commit()
+                            return
+                except Exception as e:
+                    error_msg = str(e)
+                    if "1020" in error_msg or "Record has changed" in error_msg or "Deadlock" in error_msg:
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(0.1 * (attempt + 1))
+                            continue
+                    raise
         else:
             # SQLite: simple atomic update
             async with self._connect() as db:
@@ -1346,31 +1357,42 @@ class Database:
         today = str(date.today())
         
         if self.db_type == "mysql":
-            # MySQL: use SELECT FOR UPDATE to lock the row, then update
-            import aiomysql
-            pool = await self._get_mysql_pool()
-            async with pool.acquire() as conn:
-                async with conn.cursor() as cursor:
-                    # Lock the row first
-                    await cursor.execute(
-                        "SELECT id FROM token_stats WHERE token_id = %s FOR UPDATE",
-                        (token_id,)
-                    )
-                    row = await cursor.fetchone()
-                    if not row:
-                        await cursor.execute(
-                            "INSERT INTO token_stats (token_id) VALUES (%s)",
-                            (token_id,)
-                        )
-                    # Now update atomically
-                    await cursor.execute("""
-                        UPDATE token_stats
-                        SET video_count = video_count + 1,
-                            today_video_count = IF(today_date = %s, today_video_count + 1, 1),
-                            today_date = %s
-                        WHERE token_id = %s
-                    """, (today, today, token_id))
-                    await conn.commit()
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    # MySQL: use SELECT FOR UPDATE to lock the row, then update
+                    import aiomysql
+                    pool = await self._get_mysql_pool()
+                    async with pool.acquire() as conn:
+                        async with conn.cursor() as cursor:
+                            # Lock the row first
+                            await cursor.execute(
+                                "SELECT id FROM token_stats WHERE token_id = %s FOR UPDATE",
+                                (token_id,)
+                            )
+                            row = await cursor.fetchone()
+                            if not row:
+                                await cursor.execute(
+                                    "INSERT INTO token_stats (token_id) VALUES (%s)",
+                                    (token_id,)
+                                )
+                            # Now update atomically
+                            await cursor.execute("""
+                                UPDATE token_stats
+                                SET video_count = video_count + 1,
+                                    today_video_count = IF(today_date = %s, today_video_count + 1, 1),
+                                    today_date = %s
+                                WHERE token_id = %s
+                            """, (today, today, token_id))
+                            await conn.commit()
+                            return
+                except Exception as e:
+                    error_msg = str(e)
+                    if "1020" in error_msg or "Record has changed" in error_msg or "Deadlock" in error_msg:
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(0.1 * (attempt + 1))
+                            continue
+                    raise
         else:
             # SQLite: simple atomic update
             async with self._connect() as db:
@@ -1396,33 +1418,44 @@ class Database:
         today = str(date.today())
         
         if self.db_type == "mysql":
-            # MySQL: use SELECT FOR UPDATE to lock the row, then update
-            import aiomysql
-            pool = await self._get_mysql_pool()
-            async with pool.acquire() as conn:
-                async with conn.cursor() as cursor:
-                    # Lock the row first
-                    await cursor.execute(
-                        "SELECT id FROM token_stats WHERE token_id = %s FOR UPDATE",
-                        (token_id,)
-                    )
-                    row = await cursor.fetchone()
-                    if not row:
-                        await cursor.execute(
-                            "INSERT INTO token_stats (token_id) VALUES (%s)",
-                            (token_id,)
-                        )
-                    # Now update atomically
-                    await cursor.execute("""
-                        UPDATE token_stats
-                        SET error_count = error_count + 1,
-                            consecutive_error_count = consecutive_error_count + 1,
-                            today_error_count = IF(today_date = %s, today_error_count + 1, 1),
-                            today_date = %s,
-                            last_error_at = CURRENT_TIMESTAMP
-                        WHERE token_id = %s
-                    """, (today, today, token_id))
-                    await conn.commit()
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    # MySQL: use SELECT FOR UPDATE to lock the row, then update
+                    import aiomysql
+                    pool = await self._get_mysql_pool()
+                    async with pool.acquire() as conn:
+                        async with conn.cursor() as cursor:
+                            # Lock the row first
+                            await cursor.execute(
+                                "SELECT id FROM token_stats WHERE token_id = %s FOR UPDATE",
+                                (token_id,)
+                            )
+                            row = await cursor.fetchone()
+                            if not row:
+                                await cursor.execute(
+                                    "INSERT INTO token_stats (token_id) VALUES (%s)",
+                                    (token_id,)
+                                )
+                            # Now update atomically
+                            await cursor.execute("""
+                                UPDATE token_stats
+                                SET error_count = error_count + 1,
+                                    consecutive_error_count = consecutive_error_count + 1,
+                                    today_error_count = IF(today_date = %s, today_error_count + 1, 1),
+                                    today_date = %s,
+                                    last_error_at = CURRENT_TIMESTAMP
+                                WHERE token_id = %s
+                            """, (today, today, token_id))
+                            await conn.commit()
+                            return
+                except Exception as e:
+                    error_msg = str(e)
+                    if "1020" in error_msg or "Record has changed" in error_msg or "Deadlock" in error_msg:
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(0.1 * (attempt + 1))
+                            continue
+                    raise
         else:
             # SQLite: simple atomic update
             async with self._connect() as db:
@@ -1447,22 +1480,33 @@ class Database:
     async def reset_error_count(self, token_id: int):
         """Reset consecutive error count - uses row-level lock for MySQL"""
         if self.db_type == "mysql":
-            # MySQL: use SELECT FOR UPDATE to lock the row, then update
-            import aiomysql
-            pool = await self._get_mysql_pool()
-            async with pool.acquire() as conn:
-                async with conn.cursor() as cursor:
-                    # Lock the row first
-                    await cursor.execute(
-                        "SELECT id FROM token_stats WHERE token_id = %s FOR UPDATE",
-                        (token_id,)
-                    )
-                    # Now update atomically
-                    await cursor.execute(
-                        "UPDATE token_stats SET consecutive_error_count = 0 WHERE token_id = %s",
-                        (token_id,)
-                    )
-                    await conn.commit()
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    # MySQL: use SELECT FOR UPDATE to lock the row, then update
+                    import aiomysql
+                    pool = await self._get_mysql_pool()
+                    async with pool.acquire() as conn:
+                        async with conn.cursor() as cursor:
+                            # Lock the row first
+                            await cursor.execute(
+                                "SELECT id FROM token_stats WHERE token_id = %s FOR UPDATE",
+                                (token_id,)
+                            )
+                            # Now update atomically
+                            await cursor.execute(
+                                "UPDATE token_stats SET consecutive_error_count = 0 WHERE token_id = %s",
+                                (token_id,)
+                            )
+                            await conn.commit()
+                            return
+                except Exception as e:
+                    error_msg = str(e)
+                    if "1020" in error_msg or "Record has changed" in error_msg or "Deadlock" in error_msg:
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(0.1 * (attempt + 1))
+                            continue
+                    raise
         else:
             # SQLite: simple update
             async with self._connect() as db:
