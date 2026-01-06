@@ -14,6 +14,7 @@ from pydantic import BaseModel
 import base64
 import json
 import time
+import asyncio
 import uuid
 import re
 from ..core.auth import verify_api_key_header
@@ -250,9 +251,9 @@ async def create_chat_completion(
                         style_id=request.style_id
                     ):
                         yield chunk
-                except GeneratorExit:
-                    # Client disconnected, clean exit
-                    pass
+                except (asyncio.CancelledError, GeneratorExit):
+                    # Client disconnected; allow cancellation to propagate
+                    raise
                 except Exception as e:
                     has_error = True
                     error_message = str(e)

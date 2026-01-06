@@ -4,6 +4,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from datetime import datetime
 from typing import List
 import json
+import asyncio
 import re
 from ..core.auth import verify_api_key_header
 from ..core.models import ChatCompletionRequest
@@ -186,6 +187,9 @@ async def create_chat_completion(
                         style_id=style_id
                     ):
                         yield chunk
+                except (asyncio.CancelledError, GeneratorExit):
+                    # Client disconnected; allow cancellation to propagate
+                    raise
                 except Exception as e:
                     # Return OpenAI-compatible error format
                     error_response = {
