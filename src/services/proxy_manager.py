@@ -22,8 +22,14 @@ class ProxyManager:
         """Split concatenated proxies like 'socks5://...socks5://...' into separate lines
         
         Handles cases where multiple proxies are pasted together without newlines.
+        Also handles 'st5 ' prefix format.
         """
         import re
+        # First, handle 'st5 ' prefix format by splitting on 'st5 ' or 'st5:'
+        # e.g., "st5 ip:port:user:passst5 ip:port:user:pass"
+        text = re.sub(r'(?i)st5\s+', 'socks5://', text)  # Replace 'st5 ' with 'socks5://'
+        text = re.sub(r'(?i)st5:', 'socks5://', text)    # Replace 'st5:' with 'socks5://'
+        
         # Split by protocol prefixes, keeping the delimiter
         # This handles: socks5://...socks5://... or http://...socks5://...
         parts = re.split(r'(?=(?:https?|socks5h?)://)', text)
