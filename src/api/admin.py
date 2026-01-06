@@ -976,6 +976,8 @@ async def clear_cloudflare_credentials(token: str = Depends(verify_admin_token))
 @router.get("/api/stats")
 async def get_stats(token: str = Depends(verify_admin_token)):
     """Get system statistics"""
+    from datetime import date
+    
     tokens = await token_manager.get_all_tokens()
     active_tokens = await token_manager.get_active_tokens()
 
@@ -985,6 +987,8 @@ async def get_stats(token: str = Depends(verify_admin_token)):
     today_images = 0
     today_videos = 0
     today_errors = 0
+    
+    today_str = str(date.today())
 
     for token in tokens:
         stats = await db.get_token_stats(token.id)
@@ -992,9 +996,11 @@ async def get_stats(token: str = Depends(verify_admin_token)):
             total_images += stats.image_count
             total_videos += stats.video_count
             total_errors += stats.error_count
-            today_images += stats.today_image_count
-            today_videos += stats.today_video_count
-            today_errors += stats.today_error_count
+            # Only count today's stats if today_date matches current date
+            if stats.today_date == today_str:
+                today_images += stats.today_image_count
+                today_videos += stats.today_video_count
+                today_errors += stats.today_error_count
 
     return {
         "total_tokens": len(tokens),
