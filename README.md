@@ -88,6 +88,9 @@ Sora2API 是一个 OpenAI 兼容的 Sora API 服务，支持文生图、文生�
 | `in_progress` | 处理中 |
 | `completed` | 成功 |
 | `failed` | 失败 |
+| `cancelled` | Client disconnected |
+
+Note: `cancelled` indicates the client disconnected before completion. `request_logs.status_code` is set to 499.
 
 ---
 
