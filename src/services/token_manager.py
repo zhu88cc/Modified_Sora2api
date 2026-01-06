@@ -1120,8 +1120,14 @@ class TokenManager:
             await self.db.update_token_status(token_id, False)
     
     async def record_success(self, token_id: int, is_video: bool = False):
-        """Record successful request (reset error count)"""
+        """Record successful request (reset error count and increment stats)"""
         await self.db.reset_error_count(token_id)
+        
+        # Increment generation count
+        if is_video:
+            await self.db.increment_video_count(token_id)
+        else:
+            await self.db.increment_image_count(token_id)
 
         # Update Sora2 remaining count after video generation
         if is_video:
