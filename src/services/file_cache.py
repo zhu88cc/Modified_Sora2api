@@ -65,7 +65,7 @@ class FileCache:
             # Skip cleanup if timeout is -1 (never delete)
             if self.default_timeout == -1:
                 return
-            
+
             current_time = time.time()
             removed_count = 0
             
@@ -152,11 +152,11 @@ class FileCache:
             # Get proxy if available (token-specific or global)
             proxy_url = None
             if self.proxy_manager:
-                proxy_url = await self.proxy_manager.get_proxy_url(token_id)
+                proxy_url = await self.proxy_manager.get_proxy_url()
 
             # Download with proxy support
             async with AsyncSession() as session:
-                kwargs = {"timeout": 60, "impersonate": "chrome"}
+                kwargs = {"timeout": 60}
                 if proxy_url:
                     kwargs["proxy"] = proxy_url
                 response = await session.get(url, **kwargs)

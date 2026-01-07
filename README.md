@@ -1,541 +1,205 @@
-# Sora2API
+# 本项目二次开发基于 [sora2api](https://github.com/TheSmallHanCat/sora2api)
 
-<div align="center">
+##### 原作者: [TheSmallHanCat](https://github.com/TheSmallHanCat)
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/fastapi-0.119.0-green.svg)](https://fastapi.tiangolo.com/)
-[![Docker](https://img.shields.io/badge/docker-supported-blue.svg)](https://www.docker.com/)
-
-**一个功能完整的 OpenAI 兼容 API 服务，为 Sora 提供统一的接口**
-
-</div>
+# 该项目是二开的项目请谨慎使用
 
 ---
 
+## 项目介绍
 
-## ✨ 功能特性
+Sora2API 是一个 OpenAI 兼容的 Sora API 服务，支持文生图、文生视频、图生视频、视频 Remix、角色创建等功能。
 
-### 核心功能
-- 🎨 **文生图** - 根据文本描述生成图片
-- 🖼️ **图生图** - 基于上传的图片进行创意变换
-- 🎬 **文生视频** - 根据文本描述生成视频
-- 🎥 **图生视频** - 基于图片生成相关视频
-- 📊 **多尺寸支持** - 横屏、竖屏等多种规格
-- 🎭 **视频角色功能** - 创建角色，生成角色视频
-- 🎬 **Remix 功能** - 基于已有视频继续创作
-- 🎥 **分镜功能** - 支持生成分镜视频
+**✅ 已兼容 [new-api](https://github.com/Calcium-Ion/new-api) sora2 渠道对接格式**
 
-### 高级特性
-- 🔐 **Token 管理** - 支持多 Token 管理和轮询负载均衡
-- 🌐 **代理支持** - 支持 HTTP 和 SOCKS5 代理
-- 📝 **详细日志** - 完整的请求/响应日志记录
-- 🔄 **异步处理** - 高效的异步任务处理
-- 💾 **数据持久化** - SQLite 数据库存储
-- 🎯 **OpenAI 兼容** - 完全兼容 OpenAI API 格式
-- 🛡️ **安全认证** - API Key 验证和权限管理
-- 📱 **Web 管理界面** - 直观的管理后台
+### 主要功能
+
+- 文生图片 / 图生图片
+- 文生视频 / 图生视频
+- 视频 Remix（基于已有视频二次创作）
+- 视频分镜（Storyboard）
+- 角色卡创建与引用
+- Token 池管理与自动轮询
+- 代理配置（支持单代理和代理池轮询）
+- 代理池检测（自动检测并移除无效代理）
+- 无水印模式
+- 管理后台
+
+### 批量操作功能
+
+- 批量添加 Token（支持重复检测）
+- 批量测试 Token（自动启用/禁用）
+- 批量激活 Sora2（使用邀请码）
+- 批量启用/禁用 Token
+- 批量删除禁用 Token
+
+### 性能优化
+
+- 自适应轮询机制（根据进度动态调整间隔）
+- 停滞检测（避免无效请求）
+- 并发控制（批量操作限流）
+- Token 缓存（减少数据库查询）
 
 ---
 
-## 🚀 快速开始
+## new-api 对接说明
 
-### 前置要求
+本项目的 `/v1/videos` 接口已完全兼容 new-api 的 sora2 渠道格式。
 
-- Docker 和 Docker Compose（推荐）
-- 或 Python 3.8+
+### 配置方式
 
-### 方式一：Docker 部署（推荐）
+在 new-api 中添加渠道：
+- **类型**: Sora
+- **Base URL**: `http://your-sora2api-server:8000`
+- **密钥**: 你的 API Key（默认 `han1234`）
+- **模型**: `sora-2`, `sora-2-pro`
 
-#### 标准模式（不使用代理）
+### 支持的接口
+
+| 接口 | 描述 |
+|------|------|
+| `POST /v1/videos` | 创建视频生成任务 |
+| `GET /v1/videos/{id}` | 获取任务状态 |
+| `GET /v1/videos/{id}/content` | 获取视频直链（302 重定向） |
+| `POST /v1/videos/{id}/remix` | 视频 Remix |
+
+### 响应格式
+
+```json
+{
+  "id": "sora-2-abc123def456",
+  "object": "video",
+  "model": "sora-2",
+  "status": "in_progress",
+  "progress": 50,
+  "created_at": 1702388400,
+  "completed_at": 1702388500,
+  "seconds": "10",
+  "size": "1280x720",
+  "error": null
+}
+```
+
+### 状态值
+
+| 状态 | 描述 |
+|------|------|
+| `queued` | 排队中 |
+| `in_progress` | 处理中 |
+| `completed` | 成功 |
+| `failed` | 失败 |
+| `cancelled` | Client disconnected |
+
+Note: `cancelled` indicates the client disconnected before completion. `request_logs.status_code` is set to 499.
+
+---
+
+## 快速开始
 
 ```bash
-# 克隆项目
-git clone https://github.com/TheSmallHanCat/sora2api.git
-cd sora2api
-
-# 启动服务
+# Docker 部署
 docker-compose up -d
 
-# 查看日志
-docker-compose logs -f
-```
-
-#### WARP 模式（使用代理）
-
-```bash
-# 使用 WARP 代理启动
-docker-compose -f docker-compose.warp.yml up -d
-
-# 查看日志
-docker-compose -f docker-compose.warp.yml logs -f
-```
-
-### 方式二：本地部署
-
-```bash
-# 克隆项目
-git clone https://github.com/TheSmallHanCat/sora2api.git
-cd sora2api
-
-# 创建虚拟环境
-python -m venv venv
-
-# 激活虚拟环境
-# Windows
-venv\Scripts\activate
-# Linux/Mac
-source venv/bin/activate
-
-# 安装依赖
+# 本地部署
 pip install -r requirements.txt
-
-# 启动服务
 python main.py
 ```
 
-### 首次启动
+**管理后台**: http://localhost:8000 (默认账号: admin/admin)
 
-服务启动后，访问管理后台进行初始化配置：
-
-- **地址**: http://localhost:8000
-- **用户名**: `admin`
-- **密码**: `admin`
-
-⚠️ **重要**: 首次登录后请立即修改密码！
+**默认 API Key**: `han1234`
 
 ---
 
-### 快速参考
+## 项目结构
 
-| 功能 | 模型 | 说明 |
+```
+├── config/                 # 配置文件
+│   ├── setting.toml       # 主配置文件
+│   └── setting_warp.toml  # Warp 配置
+├── data/                   # 数据目录
+│   ├── hancat.db          # SQLite 数据库
+│   └── proxy.txt          # 代理池配置（每行一个代理地址）
+├── docs/                   # API 文档
+│   └── API_V1_DOCUMENTATION.md # v1 API 文档
+├── src/                    # 源代码
+│   ├── api/               # API 路由
+│   │   ├── admin.py       # 管理接口
+│   │   ├── openai_compat.py # OpenAI 兼容接口
+│   │   ├── public.py      # 公共接口
+│   │   ├── routes.py      # 路由注册
+│   │   └── sora_compat.py # Sora 兼容接口
+│   ├── core/              # 核心模块
+│   │   ├── auth.py        # 认证
+│   │   ├── config.py      # 配置管理
+│   │   ├── database.py    # 数据库
+│   │   ├── logger.py      # 日志
+│   │   └── models.py      # 数据模型
+│   └── services/          # 业务服务
+│       ├── generation_handler.py # 生成处理
+│       ├── proxy_manager.py      # 代理管理
+│       ├── sora_client.py        # Sora 客户端
+│       └── token_manager.py      # Token 管理
+├── static/                 # 静态文件
+│   ├── login.html         # 登录页面
+│   └── manage.html        # 管理后台
+├── tests/                  # 测试脚本
+├── docker-compose.yml      # Docker 配置
+├── Dockerfile             # Docker 镜像
+├── main.py                # 入口文件
+└── requirements.txt       # 依赖
+```
+
+---
+
+## 代理池配置
+
+在 `data/proxy.txt` 中配置代理列表，每行一个：
+
+```
+# 支持格式
+http://ip:port
+http://user:pass@ip:port
+socks5://ip:port
+ip:port
+ip:port:user:pass
+```
+
+**使用逻辑：**
+1. 在管理后台启用 `代理` 和 `代理池` 开关
+2. 每次请求 Sora API 时，自动轮询使用下一个代理
+3. 代理池为空时，回退到单代理配置
+4. 修改 `proxy.txt` 后，在管理后台点击"重载代理池"生效
+
+---
+
+## API 文档
+
+详细 API 文档请参考：
+- [v1 接口文档](docs/API_V1_DOCUMENTATION.md) - 完整的 v1 API 接口文档（new-api 兼容）
+
+### 主要接口
+
+| 接口 | 方法 | 描述 |
 |------|------|------|
-| 文生图 | `gpt-image*` | 使用 `content` 为字符串 |
-| 图生图 | `gpt-image*` | 使用 `content` 数组 + `image_url` |
-| 文生视频 | `sora2-*` | 使用 `content` 为字符串 |
-| 图生视频 | `sora2-*` | 使用 `content` 数组 + `image_url` |
-| 视频风格 | `sora2-*` | 在提示词中使用 `{风格ID}` 格式,如 `{anime}提示词` |
-| 创建角色 | `sora2-*` | 使用 `content` 数组 + `video_url` |
-| 角色生成视频 | `sora2-*` | 使用 `content` 数组 + `video_url` + 文本 |
-| Remix | `sora2-*` | 在 `content` 中包含 Remix ID |
-| 视频分镜 | `sora2-*` | 在 `content` 中使用```[时长s]提示词```格式触发 |
+| `/v1/models` | GET | 获取可用模型列表 |
+| `/v1/chat/completions` | POST | 统一聊天补全接口（支持流式） |
+| `/v1/videos` | POST | 创建视频生成任务（new-api 兼容） |
+| `/v1/videos/{id}` | GET | 获取视频任务状态（new-api 兼容） |
+| `/v1/videos/{id}/content` | GET | 获取视频直链（302 重定向） |
+| `/v1/videos/{id}/remix` | POST | 视频 Remix（new-api 兼容） |
+| `/v1/images/generations` | POST | 图片生成 |
+| `/v1/characters` | POST | 角色创建 |
+| `/v1/stats` | GET | 系统统计 |
+| `/v1/feed` | GET | 公共 Feed |
+| `/api/tokens` | GET/POST | Token 管理 |
+| `/api/login` | POST | 管理员登录 |
 
 ---
 
-### API 调用
+## 许可证
 
-#### 基本信息（OpenAI标准格式，需要使用流式）
-
-- **端点**: `http://localhost:8000/v1/chat/completions`
-- **认证**: 在请求头中添加 `Authorization: Bearer YOUR_API_KEY`
-- **默认 API Key**: `han1234`（建议修改）
-
-#### 支持的模型
-
-**图片模型**
-
-| 模型 | 说明 | 尺寸 |
-|------|------|------|
-| `gpt-image` | 文生图（正方形） | 360×360 |
-| `gpt-image-landscape` | 文生图（横屏） | 540×360 |
-| `gpt-image-portrait` | 文生图（竖屏） | 360×540 |
-
-**视频模型**
-
-**标准版（Sora2）**
-
-| 模型 | 时长 | 方向 | 说明 |
-|------|------|------|------|
-| `sora2-landscape-10s` | 10秒 | 横屏 | 文生视频/图生视频 |
-| `sora2-landscape-15s` | 15秒 | 横屏 | 文生视频/图生视频 |
-| `sora2-landscape-25s` | 25秒 | 横屏 | 文生视频/图生视频 |
-| `sora2-portrait-10s` | 10秒 | 竖屏 | 文生视频/图生视频 |
-| `sora2-portrait-15s` | 15秒 | 竖屏 | 文生视频/图生视频 |
-| `sora2-portrait-25s` | 25秒 | 竖屏 | 文生视频/图生视频 |
-
-**Pro 版（需要 ChatGPT Pro 订阅）**
-
-| 模型 | 时长 | 方向 | 说明 |
-|------|------|------|------|
-| `sora2pro-landscape-10s` | 10秒 | 横屏 | Pro 质量文生视频/图生视频 |
-| `sora2pro-landscape-15s` | 15秒 | 横屏 | Pro 质量文生视频/图生视频 |
-| `sora2pro-landscape-25s` | 25秒 | 横屏 | Pro 质量文生视频/图生视频 |
-| `sora2pro-portrait-10s` | 10秒 | 竖屏 | Pro 质量文生视频/图生视频 |
-| `sora2pro-portrait-15s` | 15秒 | 竖屏 | Pro 质量文生视频/图生视频 |
-| `sora2pro-portrait-25s` | 25秒 | 竖屏 | Pro 质量文生视频/图生视频 |
-
-**Pro HD 版（需要 ChatGPT Pro 订阅，高清质量）**
-
-| 模型 | 时长 | 方向 | 说明 |
-|------|------|------|------|
-| `sora2pro-hd-landscape-10s` | 10秒 | 横屏 | Pro 高清文生视频/图生视频 |
-| `sora2pro-hd-landscape-15s` | 15秒 | 横屏 | Pro 高清文生视频/图生视频 |
-| `sora2pro-hd-portrait-10s` | 10秒 | 竖屏 | Pro 高清文生视频/图生视频 |
-| `sora2pro-hd-portrait-15s` | 15秒 | 竖屏 | Pro 高清文生视频/图生视频 |
-
-> **注意：** Pro 系列模型需要 ChatGPT Pro 订阅（`plan_type: "chatgpt_pro"`）。如果没有 Pro 账号，请求这些模型会返回错误。
-
-#### 请求示例
-
-**文生图**
-
-```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
-  -H "Authorization: Bearer han1234" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-image",
-    "messages": [
-      {
-        "role": "user",
-        "content": "一只可爱的小猫咪"
-      }
-    ],
-    "stream": true
-  }'
-```
-
-**图生图**
-
-```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
-  -H "Authorization: Bearer han1234" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-image",
-    "messages": [
-      {
-        "role": "user",
-        "content": [
-          {
-            "type": "text",
-            "text": "将这张图片变成油画风格"
-          },
-          {
-            "type": "image_url",
-            "image_url": {
-              "url": "data:image/png;base64,<base64_encoded_image_data>"
-            }
-          }
-        ]
-      }
-    ],
-    "stream": true
-  }'
-```
-
-**文生视频**
-
-```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
-  -H "Authorization: Bearer han1234" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "sora2-landscape-10s",
-    "messages": [
-      {
-        "role": "user",
-        "content": "一只小猫在草地上奔跑"
-      }
-    ],
-    "stream": true
-  }'
-```
-
-**图生视频**
-
-```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
-  -H "Authorization: Bearer han1234" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "sora2-landscape-10s",
-    "messages": [
-      {
-        "role": "user",
-        "content": [
-          {
-            "type": "text",
-            "text": "这只猫在跳舞"
-          },
-          {
-            "type": "image_url",
-            "image_url": {
-              "url": "data:image/png;base64,<base64_encoded_image_data>"
-            }
-          }
-        ]
-      }
-    ],
-    "stream": true
-  }'
-```
-
-**视频Remix（基于已有视频继续创作）**
-
-* 提示词内包含remix分享链接或id即可
-
-```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
-  -H "Authorization: Bearer han1234" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "sora2-landscape-10s",
-    "messages": [
-      {
-        "role": "user",
-        "content": "https://sora.chatgpt.com/p/s_68e3a06dcd888191b150971da152c1f5改成水墨画风格"
-      }
-    ],
-    "stream": true
-  }'
-```
-
-**视频分镜**
-
-* 示例触发提示词：
-  ```[5.0s]猫猫从飞机上跳伞 [5.0s]猫猫降落 [10.0s]猫猫在田野奔跑```
-* 或
-  ```text
-  [5.0s]猫猫从飞机上跳伞
-  [5.0s]猫猫降落
-  [10.0s]猫猫在田野奔跑
-  ```
-
-```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
-  -H "Authorization: Bearer han1234" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "sora2-landscape-10s",
-    "messages": [
-      {
-        "role": "user",
-        "content": "[5.0s]猫猫从飞机上跳伞 [5.0s]猫猫降落 [10.0s]猫猫在田野奔跑"
-      }
-    ],
-    "stream": true
-  }'
-```
-
-### 视频风格功能
-
-Sora2API 支持**视频风格**功能，可以为生成的视频应用预设风格。
-
-#### 使用方法
-
-在提示词中使用 `{风格ID}` 格式指定风格，系统会自动提取并应用该风格。
-
-#### 支持的风格
-
-| 风格ID | 显示名称 | 说明 |
-|--------|----------|------|
-| `festive` | Festive | 节日风格 |
-| `kakalaka` | 🪭👺 | 混沌风格 |
-| `news` | News | 新闻风格 |
-| `selfie` | Selfie | 自拍风格 |
-| `handheld` | Handheld | 手持风格 |
-| `golden` | Golden | 金色风格 |
-| `anime` | Anime | 动漫风格 |
-| `retro` | Retro | 复古风格 |
-| `nostalgic` | Vintage | 怀旧风格 |
-| `comic` | Comic | 漫画风格 |
-
-#### 示例
-
-**使用动漫风格生成视频**
-
-```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
-  -H "Authorization: Bearer han1234" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "sora2-landscape-10s",
-    "messages": [
-      {
-        "role": "user",
-        "content": "{anime}一只小猫在草地上奔跑"
-      }
-    ],
-    "stream": true
-  }'
-```
-
-**使用复古风格生成视频**
-
-```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
-  -H "Authorization: Bearer han1234" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "sora2-landscape-10s",
-    "messages": [
-      {
-        "role": "user",
-        "content": "{retro}城市街道夜景"
-      }
-    ],
-    "stream": true
-  }'
-```
-
-**在Remix中使用风格**
-
-```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
-  -H "Authorization: Bearer han1234" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "sora2-landscape-10s",
-    "messages": [
-      {
-        "role": "user",
-        "content": "{comic}https://sora.chatgpt.com/p/s_68e3a06dcd888191b150971da152c1f5改成漫画风格"
-      }
-    ],
-    "stream": true
-  }'
-```
-
-**注意事项**
-- 风格标记 `{风格ID}` 可以放在提示词的任意位置
-- 系统会自动提取风格ID并从提示词中移除风格标记
-- 如果不指定风格，将使用默认风格生成
-
-### 视频角色功能
-
-Sora2API 支持**视频角色生成**功能。
-
-#### 功能说明
-
-- **角色创建**: 如果只有视频，无prompt，则生成角色自动提取角色信息，输出角色名
-- **角色生成**: 有视频、prompt，则上传视频创建角色，使用角色和prompt进行生成，输出视频
-
-#### API调用（OpenAI标准格式，需要使用流式）
-
-**场景 1: 仅创建角色（不生成视频）**
-
-上传视频提取角色信息，获取角色名称和头像。
-
-```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
-  -H "Authorization: Bearer han1234" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "sora2-landscape-10s",
-    "messages": [
-      {
-        "role": "user",
-        "content": [
-          {
-            "type": "video_url",
-            "video_url": {
-              "url": "data:video/mp4;base64,<base64_encoded_video_data>"
-            }
-          }
-        ]
-      }
-    ],
-    "stream": true
-  }'
-```
-
-**场景 2: 创建角色并生成视频**
-
-上传视频创建角色，然后使用该角色生成新视频。
-
-```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
-  -H "Authorization: Bearer han1234" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "sora2-landscape-10s",
-    "messages": [
-      {
-        "role": "user",
-        "content": [
-          {
-            "type": "video_url",
-            "video_url": {
-              "url": "data:video/mp4;base64,<base64_encoded_video_data>"
-            }
-          },
-          {
-            "type": "text",
-            "text": "角色做一个跳舞的动作"
-          }
-        ]
-      }
-    ],
-    "stream": true
-  }'
-```
-
-#### Python 代码示例
-
-```python
-import requests
-import base64
-
-# 读取视频文件并编码为 Base64
-with open("video.mp4", "rb") as f:
-    video_data = base64.b64encode(f.read()).decode("utf-8")
-
-# 仅创建角色
-response = requests.post(
-    "http://localhost:8000/v1/chat/completions",
-    headers={
-        "Authorization": "Bearer han1234",
-        "Content-Type": "application/json"
-    },
-    json={
-        "model": "sora2-landscape-10s",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "video_url",
-                        "video_url": {
-                            "url": f"data:video/mp4;base64,{video_data}"
-                        }
-                    }
-                ]
-            }
-        ],
-        "stream": True
-    },
-    stream=True
-)
-
-# 处理流式响应
-for line in response.iter_lines():
-    if line:
-        print(line.decode("utf-8"))
-```
-
----
-
-## 📄 许可证
-
-本项目采用 MIT 许可证。详见 [LICENSE](LICENSE) 文件。
-
----
-
-## 🙏 致谢
-
-感谢所有贡献者和使用者的支持！
-
----
-
-## 📞 联系方式
-
-- 提交 Issue：[GitHub Issues](https://github.com/TheSmallHanCat/sora2api/issues)
-- 讨论：[GitHub Discussions](https://github.com/TheSmallHanCat/sora2api/discussions)
-
----
-
-**⭐ 如果这个项目对你有帮助，请给个 Star！**
+MIT License
 
 ## Star History
 

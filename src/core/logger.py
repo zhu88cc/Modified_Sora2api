@@ -169,7 +169,7 @@ class DebugLogger:
                     parsed = json.loads(body)
                     body_str = json.dumps(parsed, indent=2, ensure_ascii=False)
                     self.logger.info(body_str)
-                except:
+                except (json.JSONDecodeError, TypeError, ValueError):
                     # Not JSON, log as text (limit length)
                     if len(body) > 2000:
                         self.logger.info(f"{body[:2000]}... (truncated)")
@@ -213,7 +213,7 @@ class DebugLogger:
                     parsed = json.loads(response_text)
                     body_str = json.dumps(parsed, indent=2, ensure_ascii=False)
                     self.logger.info(body_str)
-                except:
+                except (json.JSONDecodeError, TypeError, ValueError):
                     # Not JSON, log as text
                     if len(response_text) > 2000:
                         self.logger.info(f"{response_text[:2000]}... (truncated)")

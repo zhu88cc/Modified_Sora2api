@@ -9,16 +9,26 @@ from typing import Optional, Dict, Any, Tuple
 from curl_cffi.requests import AsyncSession
 from curl_cffi import CurlMime
 from .proxy_manager import ProxyManager
+from .cloudflare_solver import (
+    solve_cloudflare_challenge,
+    is_cloudflare_challenge,
+    get_cloudflare_state,
+    is_cf_refreshing,
+)
 from ..core.config import config
 from ..core.logger import debug_logger
+from ..core.http_utils import build_sora_headers, DEFAULT_USER_AGENT, get_random_fingerprint, get_random_user_agent
+
 
 class SoraClient:
     """Sora API client with proxy support"""
 
     def __init__(self, proxy_manager: ProxyManager):
         self.proxy_manager = proxy_manager
-        self.base_url = config.sora_base_url
-        self.timeout = config.sora_timeout
+        self.timeout = config.sora_timeout  # 从配置读取超时时间
+        self.base_url = config.sora_base_url  # 从配置读取基础URL
+        # 持久化 session 字典，按 token 分组维护 cookie
+        self._sessions: Dict[str, AsyncSession] = {}
 
     @staticmethod
     def _generate_sentinel_token() -> str:
@@ -28,7 +38,9 @@ class SoraClient:
         生成10-20个字符的随机字符串（字母+数字）
         """
         length = random.randint(10, 20)
-        random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+        random_str = "".join(
+            random.choices(string.ascii_letters + string.digits, k=length)
+        )
         return random_str
 
     @staticmethod
@@ -93,12 +105,31 @@ class SoraClient:
         else:
             return timeline
 
+    async def _get_session(self, token: str) -> AsyncSession:
+        """获取或创建持久化 session，并应用全局 Cloudflare cookies"""
+        from ..core.http_utils import get_random_fingerprint
+
+        cf_state = get_cloudflare_state(token=token)
+
+        if token not in self._sessions:
+            # 使用随机手机指纹
+            self._sessions[token] = AsyncSession(impersonate=get_random_fingerprint())
+
+        session = self._sessions[token]
+
+        # 应用全局 Cloudflare cookies 到 session
+        if cf_state.is_valid:
+            cf_state.apply_to_session(session)
+
+        return session
+
     async def _make_request(self, method: str, endpoint: str, token: str,
                            json_data: Optional[Dict] = None,
                            multipart: Optional[Dict] = None,
                            add_sentinel_token: bool = False,
+                           max_retries: int = 3,
                            token_id: Optional[int] = None) -> Dict[str, Any]:
-        """Make HTTP request with proxy support
+        """Make HTTP request with proxy support and 429 retry
 
         Args:
             method: HTTP method (GET/POST)
@@ -107,28 +138,48 @@ class SoraClient:
             json_data: JSON request body
             multipart: Multipart form data (for file uploads)
             add_sentinel_token: Whether to add openai-sentinel-token header (only for generation requests)
+            max_retries: Maximum number of retries for 429/CF errors
             token_id: Token ID for getting token-specific proxy (optional)
         """
+        import asyncio
+
         proxy_url = await self.proxy_manager.get_proxy_url(token_id)
+        cf_state = get_cloudflare_state(token_id=token_id, token=token)
 
-        headers = {
-            "Authorization": f"Bearer {token}"
-        }
+        # 使用全局 Cloudflare 状态的 user_agent，如果有的话
+        user_agent = cf_state.user_agent or DEFAULT_USER_AGENT
+        sentinel = self._generate_sentinel_token() if add_sentinel_token else None
+        content_type = None if multipart else "application/json"
 
-        # 只在生成请求时添加 sentinel token
-        if add_sentinel_token:
-            headers["openai-sentinel-token"] = self._generate_sentinel_token()
+        headers = build_sora_headers(
+            token=token,
+            user_agent=user_agent,
+            content_type=content_type,
+            sentinel_token=sentinel
+        )
 
-        if not multipart:
-            headers["Content-Type"] = "application/json"
+        url = f"{config.sora_base_url}{endpoint}"
 
-        async with AsyncSession() as session:
-            url = f"{self.base_url}{endpoint}"
+        # 使用持久化 session 维护 cookie（会自动应用全局 Cloudflare cookies）
+        session = await self._get_session(token)
+
+        attempt = 0
+        cf_refresh_attempted = False
+        cf_retry_count = 0  # CF challenge retry counter (max 3 when CF solver disabled)
+        MAX_CF_RETRY_WITHOUT_SOLVER = 3  # Max retries when CF solver is disabled
+
+        while attempt <= max_retries:
+            # 每次请求前更新 headers 中的 User-Agent（使用全局状态）
+            if cf_state.user_agent:
+                headers["User-Agent"] = cf_state.user_agent
+
+            # 重新应用全局 Cloudflare cookies 到 session
+            if cf_state.is_valid:
+                cf_state.apply_to_session(session)
 
             kwargs = {
                 "headers": headers,
                 "timeout": self.timeout,
-                "impersonate": "chrome"  # 自动生成 User-Agent 和浏览器指纹
             }
 
             if proxy_url:
@@ -159,7 +210,7 @@ class SoraClient:
             elif method == "POST":
                 response = await session.post(url, **kwargs)
             else:
-                raise ValueError(f"Unsupported method: {method}")
+                raise ValueError(f"不支持的请求方法: {method}")
 
             # Calculate duration
             duration_ms = (time.time() - start_time) * 1000
@@ -167,7 +218,7 @@ class SoraClient:
             # Parse response
             try:
                 response_json = response.json()
-            except:
+            except (ValueError, TypeError):
                 response_json = None
 
             # Log response
@@ -178,45 +229,223 @@ class SoraClient:
                 duration_ms=duration_ms
             )
 
+            # Handle 429/403 rate limit with retry (Cloudflare challenge can return either)
+            if response.status_code in [429, 403]:
+                # If CF solver not enabled, fail fast without retry
+                if not config.cf_enabled:
+                    error_msg = f"HTTP {response.status_code} rate limited"
+                    debug_logger.log_error(
+                        error_message=error_msg,
+                        status_code=response.status_code,
+                        response_text=response.text
+                    )
+                    raise Exception(error_msg)
+
+                should_try_cf = config.cf_enabled
+
+                # CF solver enabled - try to refresh credentials for all 429/403
+                if should_try_cf:
+                    # Only refresh if we haven't already tried in this request cycle
+                    if not cf_refresh_attempted:
+                        # Check if another request is already refreshing CF credentials
+                        if await is_cf_refreshing(token_id=token_id, token=token):
+                            # Wait silently, solve_cloudflare_challenge will print logs
+                            await asyncio.sleep(random.uniform(2, 4))
+                            attempt += 1
+                            continue
+
+                        print(f"🔄 检测到 {response.status_code}，获取 CF 凭据...")
+                        cf_state.invalidate()  # Mark as invalid first
+
+                        try:
+                            cf_result = await solve_cloudflare_challenge(
+                                proxy_url,
+                                force_refresh=True,
+                                token_id=token_id,
+                                token=token,
+                                bypass_cooldown=False  # Respect cooldown to avoid hammering CF solver
+                            )
+                            cf_refresh_attempted = True
+                            if cf_result:
+                                # Jitter to avoid thundering herd after challenge refresh
+                                await asyncio.sleep(random.uniform(0.3, 1.0))
+                                # Global state updated, re-apply to current session
+                                cf_state.apply_to_session(session)
+                                if cf_state.user_agent:
+                                    headers["User-Agent"] = cf_state.user_agent
+
+                                attempt += 1
+                                continue
+                            else:
+                                # CF solver failed, retry without refreshing again
+                                if attempt < max_retries:
+                                    wait_time = min((attempt + 1) * 3, 30) + random.uniform(0.5, 1.5)
+                                    print(f"⚠️ CF 凭据获取失败，{wait_time:.1f}秒后重试")
+                                    await asyncio.sleep(wait_time)
+                                    attempt += 1
+                                    continue
+                        except Exception as cf_error:
+                            print(f"⚠️ CF 解决失败: {cf_error}")
+                            # Still retry if attempts remain
+                            if attempt < max_retries:
+                                wait_time = min((attempt + 1) * 3, 30) + random.uniform(0.5, 1.5)
+                                await asyncio.sleep(wait_time)
+                                attempt += 1
+                                continue
+                    else:
+                        # Already tried refreshing CF credentials, just retry with existing ones
+                        if attempt < max_retries:
+                            wait_time = min((attempt + 1) * 3, 30) + random.uniform(0.5, 1.5)
+                            print(f"⚠️ {response.status_code} 持续（已尝试 CF），{wait_time:.1f}秒后重试")
+                            await asyncio.sleep(wait_time)
+                            attempt += 1
+                            continue
+
+                # Final error if all retries exhausted
+                if response.status_code == 429:
+                    error_msg = f"速率限制超过 {max_retries} 次重试"
+                    debug_logger.log_error(
+                        error_message=error_msg,
+                        status_code=429,
+                        response_text=response.text
+                    )
+                    raise Exception(error_msg)
+                elif response.status_code == 403:
+                    error_msg = f"403 禁止访问，超过 {max_retries} 次重试"
+                    debug_logger.log_error(
+                        error_message=error_msg,
+                        status_code=403,
+                        response_text=response.text
+                    )
+                    raise Exception(error_msg)
+
             # Check status
             if response.status_code not in [200, 201]:
-                # Parse error response
-                error_data = None
-                try:
-                    error_data = response.json()
-                except:
-                    pass
+                # Try to extract error message from response JSON
+                error_detail = None
+                if response_json and isinstance(response_json, dict):
+                    error_obj = response_json.get("error", {})
+                    if isinstance(error_obj, dict):
+                        error_detail = error_obj.get("message")
 
-                # Check for unsupported_country_code error
-                if error_data and isinstance(error_data, dict):
-                    error_info = error_data.get("error", {})
-                    if error_info.get("code") == "unsupported_country_code":
-                        # Create structured error with full error data
-                        import json
-                        error_msg = json.dumps(error_data)
-                        debug_logger.log_error(
-                            error_message=f"Unsupported country: {error_msg}",
-                            status_code=response.status_code,
-                            response_text=error_msg
-                        )
-                        # Raise exception with structured error data
-                        raise Exception(error_msg)
+                # Use extracted error message or fall back to raw response
+                if error_detail:
+                    error_msg = f"{error_detail}"
+                else:
+                    error_msg = f"API 请求失败: {response.status_code} - {response.text}"
 
-                # Generic error handling
-                error_msg = f"API request failed: {response.status_code} - {response.text}"
+                # Check for non-retryable errors (401, insufficient balance, etc.)
+                is_auth_error = response.status_code == 401
+                is_balance_error = any(keyword in error_msg.lower() for keyword in [
+                    'insufficient', 'balance', 'quota', 'limit exceeded', 'no credits',
+                    'out of', 'exhausted', 'remaining', '余额', '次数'
+                ])
+
+                # Print error to console
+                print(f"❌ [SoraClient] {method} {url} 失败: {response.status_code}")
+                print(f"   响应: {response.text[:500] if response.text else '无响应体'}")
+
                 debug_logger.log_error(
                     error_message=error_msg,
                     status_code=response.status_code,
                     response_text=response.text
                 )
+
+                # Don't retry auth errors or balance errors
+                if is_auth_error or is_balance_error:
+                    raise Exception(error_msg)
+
+                # For 5xx server errors, retry if attempts remain
+                if response.status_code >= 500 and attempt < max_retries:
+                    wait_time = min((attempt + 1) * 2, 30)
+                    print(f"⚠️ 服务器错误 {response.status_code}，{wait_time} 秒后重试 ({attempt + 1}/{max_retries})...")
+                    await asyncio.sleep(wait_time)
+                    attempt += 1
+                    continue
+
                 raise Exception(error_msg)
 
             return response_json if response_json else response.json()
-    
+
+        # If we exit the loop without returning, all retries exhausted
+        raise Exception(f"请求失败，已重试 {max_retries} 次")
+
     async def get_user_info(self, token: str) -> Dict[str, Any]:
         """Get user information"""
         return await self._make_request("GET", "/me", token)
-    
+
+    async def get_profile_feed(self, token: str, limit: int = 8) -> Dict[str, Any]:
+        """Get user's profile feed (published posts)
+
+        Args:
+            token: Access token
+            limit: Number of items to fetch (default 8)
+
+        Returns:
+            Profile feed data with items array
+        """
+        return await self._make_request("GET", f"/project_y/profile_feed/me?limit={limit}&cut=nf2", token)
+
+    async def get_user_profile(self, username: str, token: str) -> Dict[str, Any]:
+        """Get user profile by username
+
+        Args:
+            username: Username to lookup
+            token: Access token
+
+        Returns:
+            User profile data
+        """
+        return await self._make_request("GET", f"/project_y/profile/username/{username}", token)
+
+    async def get_user_feed(self, user_id: str, token: str, limit: int = 8, cursor: str = None) -> Dict[str, Any]:
+        """Get user's published posts by user_id
+
+        Args:
+            user_id: User ID (e.g., user-4qluo8ATzeEsuvCpOUAfAZY0)
+            token: Access token
+            limit: Number of items to fetch (default 8)
+            cursor: Pagination cursor for next page
+
+        Returns:
+            User's feed data with items array and cursor
+        """
+        url = f"/project_y/profile_feed/{user_id}?limit={limit}&cut=nf2"
+        if cursor:
+            url = f"/project_y/profile_feed/{user_id}?cursor={cursor}&limit={limit}&cut=nf2"
+        return await self._make_request("GET", url, token)
+
+    async def search_character(self, username: str, token: str, limit: int = 10, intent: str = "users") -> Dict[str, Any]:
+        """Search for character/user by username
+
+        Args:
+            username: Username to search for
+            token: Access token
+            limit: Number of results to return (default 10)
+            intent: Search intent - 'users' for all users, 'cameo' for users that can be used in video generation
+
+        Returns:
+            Search results with profile information
+        """
+        return await self._make_request("GET", f"/project_y/profile/search_mentions?username={username}&intent={intent}&limit={limit}", token)
+
+    async def get_public_feed(self, token: str, limit: int = 8, cut: str = "nf2_latest", cursor: str = None) -> Dict[str, Any]:
+        """Get public feed (latest or top posts)
+
+        Args:
+            token: Access token
+            limit: Number of items to fetch (default 8)
+            cut: Feed type - 'nf2_latest' for latest, 'nf2_top' for top posts, 'nf2' for default
+            cursor: Pagination cursor for next page
+
+        Returns:
+            Feed data with items array and cursor for pagination
+        """
+        url = f"/project_y/feed?limit={limit}&cut={cut}"
+        if cursor:
+            url = f"/project_y/feed?cursor={cursor}&limit={limit}&cut={cut}"
+        return await self._make_request("GET", url, token)
+
     async def upload_image(self, image_data: bytes, token: str, filename: str = "image.png") -> str:
         """Upload image and return media_id
 
@@ -274,25 +503,25 @@ class SoraClient:
             "inpaint_items": inpaint_items
         }
 
-        # 生成请求需要添加 sentinel token
-        result = await self._make_request("POST", "/video_gen", token, json_data=json_data, add_sentinel_token=True, token_id=token_id)
+        # 生成请求需要添加 sentinel token，429 最多重试 3 次
+        result = await self._make_request("POST", "/video_gen", token, json_data=json_data, add_sentinel_token=True, max_retries=3)
         return result["id"]
     
     async def generate_video(self, prompt: str, token: str, orientation: str = "landscape",
-                            media_id: Optional[str] = None, n_frames: int = 450, style_id: Optional[str] = None,
-                            model: str = "sy_8", size: str = "small", token_id: Optional[int] = None) -> str:
+                            media_id: Optional[str] = None, n_frames: int = 450,
+                            style_id: Optional[str] = None,
+                            model: str = "sy_8", size: str = "small") -> str:
         """Generate video (text-to-video or image-to-video)
 
         Args:
-            prompt: Video generation prompt
+            prompt: Generation prompt
             token: Access token
-            orientation: Video orientation (landscape/portrait)
-            media_id: Optional image media_id for image-to-video
-            n_frames: Number of frames (300/450/750)
-            style_id: Optional style ID
+            orientation: Video orientation (portrait/landscape)
+            media_id: Optional media ID for image-to-video
+            n_frames: Number of frames (150=5s, 300=10s, 450=15s, 600=20s, 750=25s)
+            style_id: Optional style ID (festive, retro, news, selfie, handheld, anime, comic, golden, vintage)
             model: Model to use (sy_8 for standard, sy_ore for pro)
             size: Video size (small for standard, large for HD)
-            token_id: Token ID for getting token-specific proxy (optional)
         """
         inpaint_items = []
         if media_id:
@@ -312,8 +541,12 @@ class SoraClient:
             "style_id": style_id
         }
 
-        # 生成请求需要添加 sentinel token
-        result = await self._make_request("POST", "/nf/create", token, json_data=json_data, add_sentinel_token=True, token_id=token_id)
+        # Add style_id if provided
+        if style_id:
+            json_data["style_id"] = style_id.lower()
+
+        # 生成请求需要添加 sentinel token，429 最多重试 3 次
+        result = await self._make_request("POST", "/nf/create", token, json_data=json_data, add_sentinel_token=True, max_retries=3)
         return result["id"]
     
     async def get_image_tasks(self, token: str, limit: int = 20, token_id: Optional[int] = None) -> Dict[str, Any]:
@@ -325,7 +558,7 @@ class SoraClient:
         return await self._make_request("GET", f"/project_y/profile/drafts?limit={limit}", token, token_id=token_id)
 
     async def get_pending_tasks(self, token: str, token_id: Optional[int] = None) -> list:
-        """Get pending video generation tasks
+        """Get pending video generation tasks (v1)
 
         Returns:
             List of pending tasks with progress information
@@ -333,6 +566,39 @@ class SoraClient:
         result = await self._make_request("GET", "/nf/pending/v2", token, token_id=token_id)
         # The API returns a list directly
         return result if isinstance(result, list) else []
+
+    async def get_pending_tasks_v2(self, token: str) -> list:
+        """Get pending video generation tasks (v2)
+
+        Returns:
+            List of pending tasks with progress information
+        """
+        result = await self._make_request("GET", "/nf/pending/v2", token)
+        # The API returns a list directly
+        return result if isinstance(result, list) else []
+
+    async def get_task_progress(self, task_id: str, token: str) -> Optional[Dict[str, Any]]:
+        """Get video generation task progress by task ID
+
+        Args:
+            task_id: Task ID (e.g., task_01kcybbj56fp7vctvpmx0drrw1)
+            token: Access token
+
+        Returns:
+            Task progress info with fields:
+            - id: task ID
+            - status: task status (running/completed/failed)
+            - prompt: generation prompt
+            - title: task title
+            - progress_pct: progress percentage (0.0-1.0)
+            - generations: list of generated videos
+            Returns None if task not found
+        """
+        pending_tasks = await self.get_pending_tasks_v2(token)
+        for task in pending_tasks:
+            if task.get("id") == task_id:
+                return task
+        return None
 
     async def post_video_for_watermark_free(self, generation_id: str, prompt: str, token: str) -> str:
         """Post video to get watermark-free version
@@ -374,59 +640,71 @@ class SoraClient:
         proxy_url = await self.proxy_manager.get_proxy_url()
 
         headers = {
-            "Authorization": f"Bearer {token}"
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Origin": "https://sora.chatgpt.com",
+            "Pragma": "no-cache",
+            "Referer": "https://sora.chatgpt.com/",
+            "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
         }
 
-        async with AsyncSession() as session:
-            url = f"{self.base_url}/project_y/post/{post_id}"
+        session = await self._get_session(token)
+        url = f"{self.base_url}/project_y/post/{post_id}"
 
-            kwargs = {
-                "headers": headers,
-                "timeout": self.timeout,
-                "impersonate": "chrome"
-            }
+        kwargs = {
+            "headers": headers,
+            "timeout": self.timeout,
+        }
 
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
+        if proxy_url:
+            kwargs["proxy"] = proxy_url
 
-            # Log request
-            debug_logger.log_request(
-                method="DELETE",
-                url=url,
-                headers=headers,
-                body=None,
-                files=None,
-                proxy=proxy_url
-            )
+        # Log request
+        debug_logger.log_request(
+            method="DELETE",
+            url=url,
+            headers=headers,
+            body=None,
+            files=None,
+            proxy=proxy_url
+        )
 
-            # Record start time
-            start_time = time.time()
+        # Record start time
+        start_time = time.time()
 
-            # Make DELETE request
-            response = await session.delete(url, **kwargs)
+        # Make DELETE request
+        response = await session.delete(url, **kwargs)
 
-            # Calculate duration
-            duration_ms = (time.time() - start_time) * 1000
+        # Calculate duration
+        duration_ms = (time.time() - start_time) * 1000
 
-            # Log response
-            debug_logger.log_response(
+        # Log response
+        debug_logger.log_response(
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            body=response.text if response.text else "No content",
+            duration_ms=duration_ms
+        )
+
+        # Check status (DELETE typically returns 204 No Content or 200 OK)
+        if response.status_code not in [200, 204]:
+            error_msg = f"Delete post failed: {response.status_code} - {response.text}"
+            debug_logger.log_error(
+                error_message=error_msg,
                 status_code=response.status_code,
-                headers=dict(response.headers),
-                body=response.text if response.text else "No content",
-                duration_ms=duration_ms
+                response_text=response.text
             )
+            raise Exception(error_msg)
 
-            # Check status (DELETE typically returns 204 No Content or 200 OK)
-            if response.status_code not in [200, 204]:
-                error_msg = f"Delete post failed: {response.status_code} - {response.text}"
-                debug_logger.log_error(
-                    error_message=error_msg,
-                    status_code=response.status_code,
-                    response_text=response.text
-                )
-                raise Exception(error_msg)
-
-            return True
+        return True
 
     async def get_watermark_free_url_custom(self, parse_url: str, parse_token: str, post_id: str) -> str:
         """Get watermark-free video URL from custom parse server
@@ -456,7 +734,7 @@ class SoraClient:
         kwargs = {
             "json": json_data,
             "timeout": 30,
-            "impersonate": "chrome"
+            "impersonate": get_random_fingerprint()
         }
 
         if proxy_url:
@@ -522,12 +800,13 @@ class SoraClient:
 
     # ==================== Character Creation Methods ====================
 
-    async def upload_character_video(self, video_data: bytes, token: str) -> str:
+    async def upload_character_video(self, video_data: bytes, token: str, timestamps: str = None) -> str:
         """Upload character video and return cameo_id
 
         Args:
             video_data: Video file bytes
             token: Access token
+            timestamps: Optional custom timestamps (e.g., "0,3" or "1,5"), defaults to "0,3"
 
         Returns:
             cameo_id
@@ -539,9 +818,11 @@ class SoraClient:
             filename="video.mp4",
             data=video_data
         )
+        # Use custom timestamps if provided, otherwise default to "0,3"
+        ts_value = timestamps if timestamps else "0,3"
         mp.addpart(
             name="timestamps",
-            data=b"0,3"
+            data=ts_value.encode('utf-8')
         )
 
         result = await self._make_request("POST", "/characters/upload", token, multipart=mp)
@@ -572,7 +853,7 @@ class SoraClient:
 
         kwargs = {
             "timeout": self.timeout,
-            "impersonate": "chrome"
+            "impersonate": get_random_fingerprint()
         }
 
         if proxy_url:
@@ -585,7 +866,8 @@ class SoraClient:
             return response.content
 
     async def finalize_character(self, cameo_id: str, username: str, display_name: str,
-                                profile_asset_pointer: str, instruction_set, token: str) -> str:
+                                profile_asset_pointer: str, instruction_set, token: str,
+                                safety_instruction_set: str = None) -> str:
         """Finalize character creation
 
         Args:
@@ -593,26 +875,52 @@ class SoraClient:
             username: Character username
             display_name: Character display name
             profile_asset_pointer: Asset pointer from upload_character_image
-            instruction_set: Character instruction set (not used by API, always set to None)
+            instruction_set: Character instruction set text (optional, will be wrapped in proper format)
             token: Access token
+            safety_instruction_set: Safety instruction set text (optional, will be wrapped in proper format)
 
         Returns:
             character_id
         """
-        # Note: API always expects instruction_set to be null
-        # The instruction_set parameter is kept for backward compatibility but not used
-        _ = instruction_set  # Suppress unused parameter warning
+        # Format instruction_set if provided
+        formatted_instruction_set = None
+        if instruction_set:
+            formatted_instruction_set = {
+                "value": [{"type": "text", "value": instruction_set}]
+            }
+
+        # Format safety_instruction_set if provided
+        formatted_safety_instruction_set = None
+        if safety_instruction_set:
+            formatted_safety_instruction_set = {
+                "value": [{"type": "text", "value": safety_instruction_set}]
+            }
+
         json_data = {
             "cameo_id": cameo_id,
             "username": username,
             "display_name": display_name,
             "profile_asset_pointer": profile_asset_pointer,
-            "instruction_set": None,
-            "safety_instruction_set": None
+            "instruction_set": formatted_instruction_set,
+            "safety_instruction_set": formatted_safety_instruction_set
         }
 
         result = await self._make_request("POST", "/characters/finalize", token, json_data=json_data)
         return result.get("character", {}).get("character_id")
+
+    async def check_username_available(self, username: str, token: str) -> bool:
+        """Check if username is available
+
+        Args:
+            username: Username to check
+            token: Access token
+
+        Returns:
+            True if username is available, False otherwise
+        """
+        json_data = {"username": username}
+        result = await self._make_request("POST", "/project_y/profile/username/check", token, json_data=json_data)
+        return result.get("available", False)
 
     async def set_character_public(self, cameo_id: str, token: str) -> bool:
         """Set character as public
@@ -627,6 +935,40 @@ class SoraClient:
         json_data = {"visibility": "public"}
         await self._make_request("POST", f"/project_y/cameos/by_id/{cameo_id}/update_v2", token, json_data=json_data)
         return True
+
+    async def update_character_instructions(self, cameo_id: str, token: str,
+                                           instruction_set: str = None,
+                                           safety_instruction_set: str = None,
+                                           visibility: str = None) -> Dict[str, Any]:
+        """Update character instruction_set and safety_instruction_set
+
+        Args:
+            cameo_id: The cameo ID
+            token: Access token
+            instruction_set: Instruction set text (will be wrapped in proper format)
+            safety_instruction_set: Safety instruction set text (will be wrapped in proper format)
+            visibility: Visibility setting (public/private)
+
+        Returns:
+            Updated character info from API
+        """
+        json_data = {}
+
+        if visibility:
+            json_data["visibility"] = visibility
+
+        if instruction_set is not None:
+            json_data["instruction_set"] = {
+                "value": [{"type": "text", "value": instruction_set}]
+            }
+
+        if safety_instruction_set is not None:
+            json_data["safety_instruction_set"] = {
+                "value": [{"type": "text", "value": safety_instruction_set}]
+            }
+
+        result = await self._make_request("POST", f"/project_y/cameos/by_id/{cameo_id}/update_v2", token, json_data=json_data)
+        return result
 
     async def upload_character_image(self, image_data: bytes, token: str) -> str:
         """Upload character image and return asset_pointer
@@ -666,25 +1008,37 @@ class SoraClient:
         proxy_url = await self.proxy_manager.get_proxy_url()
 
         headers = {
-            "Authorization": f"Bearer {token}"
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Origin": "https://sora.chatgpt.com",
+            "Pragma": "no-cache",
+            "Referer": "https://sora.chatgpt.com/",
+            "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
         }
 
-        async with AsyncSession() as session:
-            url = f"{self.base_url}/project_y/characters/{character_id}"
+        session = await self._get_session(token)
+        url = f"{self.base_url}/project_y/characters/{character_id}"
 
-            kwargs = {
-                "headers": headers,
-                "timeout": self.timeout,
-                "impersonate": "chrome"
-            }
+        kwargs = {
+            "headers": headers,
+            "timeout": self.timeout,
+        }
 
-            if proxy_url:
-                kwargs["proxy"] = proxy_url
+        if proxy_url:
+            kwargs["proxy"] = proxy_url
 
-            response = await session.delete(url, **kwargs)
-            if response.status_code not in [200, 204]:
-                raise Exception(f"Failed to delete character: {response.status_code}")
-            return True
+        response = await session.delete(url, **kwargs)
+        if response.status_code not in [200, 204]:
+            raise Exception(f"Failed to delete character: {response.status_code}")
+        return True
 
     async def remix_video(self, remix_target_id: str, prompt: str, token: str,
                          orientation: str = "portrait", n_frames: int = 450, style_id: Optional[str] = None) -> str:

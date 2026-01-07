@@ -5,6 +5,8 @@ import base64
 import time
 import random
 import re
+import sys
+from dataclasses import dataclass
 from typing import Optional, AsyncGenerator, Dict, Any
 from datetime import datetime
 from .sora_client import SoraClient
@@ -13,12 +15,120 @@ from .load_balancer import LoadBalancer
 from .file_cache import FileCache
 from .concurrency_manager import ConcurrencyManager
 from ..core.database import Database
-from ..core.models import Task, RequestLog
+from ..core.models import Task, RequestLog, CharacterOptions, Character
 from ..core.config import config
 from ..core.logger import debug_logger
+from ..core.http_utils import get_random_fingerprint
+
+
+@dataclass
+class PollingConfig:
+    """Configuration for adaptive polling intervals
+
+    Attributes:
+        low_progress_interval: Polling interval when progress < 30% (default: 5.0s)
+        mid_progress_interval: Polling interval when 30% <= progress < 70% (default: 3.0s)
+        high_progress_interval: Polling interval when progress >= 70% (default: 2.0s)
+        stall_threshold: Number of consecutive polls with no progress change before stall detection (default: 3)
+        stall_multiplier: Multiplier applied to interval when stall is detected (default: 1.5)
+        max_interval: Maximum polling interval cap (default: 10.0s)
+    """
+    low_progress_interval: float = 5.0   # progress < 30%
+    mid_progress_interval: float = 3.0   # 30% <= progress < 70%
+    high_progress_interval: float = 2.0  # progress >= 70%
+    stall_threshold: int = 3             # consecutive polls with no change
+    stall_multiplier: float = 1.5        # interval increase when stalled
+    max_interval: float = 10.0           # maximum polling interval
+
+
+class AdaptivePoller:
+    """Adaptive polling controller that adjusts polling intervals based on task progress
+
+    This class implements an adaptive polling mechanism that:
+    1. Uses different polling intervals based on progress percentage
+    2. Detects stalls (no progress change) and increases interval accordingly
+
+    Requirements:
+    - 1.1: Use adaptive polling intervals based on task progress
+    - 1.2: Use 5s interval when progress < 30%
+    - 1.3: Use 3s interval when 30% <= progress < 70%
+    - 1.4: Use 2s interval when progress >= 70%
+    - 1.5: Increase interval by 50% when no progress for 3 consecutive polls
+    """
+
+    def __init__(self, config: Optional[PollingConfig] = None):
+        """Initialize the adaptive poller
+
+        Args:
+            config: Optional polling configuration. Uses defaults if not provided.
+        """
+        self.config = config or PollingConfig()
+        self.last_progress: float = 0.0
+        self.no_change_count: int = 0
+        self.current_interval: float = self.config.low_progress_interval
+
+    def get_interval(self, progress: float) -> float:
+        """Get the polling interval based on current progress
+
+        Args:
+            progress: Current task progress (0-100)
+
+        Returns:
+            Polling interval in seconds
+
+        Requirements:
+        - 1.2: 5s when progress < 30%
+        - 1.3: 3s when 30% <= progress < 70%
+        - 1.4: 2s when progress >= 70%
+        """
+        if progress < 30:
+            base_interval = self.config.low_progress_interval
+        elif progress < 70:
+            base_interval = self.config.mid_progress_interval
+        else:
+            base_interval = self.config.high_progress_interval
+
+        # Apply stall multiplier if stalled
+        if self.no_change_count >= self.config.stall_threshold:
+            # Calculate how many times we've exceeded the threshold
+            stall_factor = self.config.stall_multiplier
+            adjusted_interval = base_interval * stall_factor
+            return min(adjusted_interval, self.config.max_interval)
+
+        return base_interval
+
+    def record_progress(self, progress: float) -> None:
+        """Record progress and update stall detection state
+
+        Args:
+            progress: Current task progress (0-100)
+
+        Requirements:
+        - 1.5: Detect stall when no progress change for 3 consecutive polls
+        """
+        if progress == self.last_progress:
+            self.no_change_count += 1
+        else:
+            self.no_change_count = 0
+            self.last_progress = progress
+
+    def reset(self) -> None:
+        """Reset the poller state for a new task"""
+        self.last_progress = 0.0
+        self.no_change_count = 0
+        self.current_interval = self.config.low_progress_interval
+
+    def is_stalled(self) -> bool:
+        """Check if the task is currently considered stalled
+
+        Returns:
+            True if no progress change detected for stall_threshold consecutive polls
+        """
+        return self.no_change_count >= self.config.stall_threshold
 
 # Model configuration
 MODEL_CONFIG = {
+    # Image models
     "gpt-image": {
         "type": "image",
         "width": 360,
@@ -150,10 +260,87 @@ MODEL_CONFIG = {
     "sora2pro-hd-portrait-15s": {
         "type": "video",
         "orientation": "portrait",
-        "n_frames": 450,
-        "model": "sy_ore",
-        "size": "large",
-        "require_pro": True
+        "n_frames": 450
+    },
+    # Video models with 25s duration (750 frames)
+    "sora-video-25s": {
+        "type": "video",
+        "orientation": "landscape",
+        "n_frames": 750,
+        "model": "sy_8",
+        "size": "small"
+    },
+    "sora-video-landscape-25s": {
+        "type": "video",
+        "orientation": "landscape",
+        "n_frames": 750,
+        "model": "sy_8",
+        "size": "small"
+    },
+    "sora-video-portrait-25s": {
+        "type": "video",
+        "orientation": "portrait",
+        "n_frames": 750,
+        "model": "sy_8",
+        "size": "small"
+    },
+    # Sora2 aliases (same as sora-video-*)
+    "sora2-10s": {
+        "type": "video",
+        "orientation": "landscape",
+        "n_frames": 300
+    },
+    "sora2-landscape-10s": {
+        "type": "video",
+        "orientation": "landscape",
+        "n_frames": 300
+    },
+    "sora2-portrait-10s": {
+        "type": "video",
+        "orientation": "portrait",
+        "n_frames": 300
+    },
+    "sora2-15s": {
+        "type": "video",
+        "orientation": "landscape",
+        "n_frames": 450
+    },
+    "sora2-landscape-15s": {
+        "type": "video",
+        "orientation": "landscape",
+        "n_frames": 450
+    },
+    "sora2-portrait-15s": {
+        "type": "video",
+        "orientation": "portrait",
+        "n_frames": 450
+    },
+    "sora2-25s": {
+        "type": "video",
+        "orientation": "landscape",
+        "n_frames": 750,
+        "model": "sy_8",
+        "size": "small"
+    },
+    "sora2-landscape-25s": {
+        "type": "video",
+        "orientation": "landscape",
+        "n_frames": 750,
+        "model": "sy_8",
+        "size": "small"
+    },
+    "sora2-portrait-25s": {
+        "type": "video",
+        "orientation": "portrait",
+        "n_frames": 750,
+        "model": "sy_8",
+        "size": "small"
+    },
+    # Simple sora-2 alias (default to 10s landscape)
+    "sora-2": {
+        "type": "video",
+        "orientation": "landscape",
+        "n_frames": 300
     }
 }
 
@@ -226,6 +413,39 @@ class GenerationHandler:
 
         return final_username
 
+    async def _ensure_username_available(self, username: str, token: str, max_retries: int = 5) -> str:
+        """Ensure username is available, append random suffix if not
+
+        Args:
+            username: Desired username
+            token: Access token
+            max_retries: Maximum number of retries to find available username
+
+        Returns:
+            Available username (original or with random suffix)
+        """
+        # First check if original username is available
+        is_available = await self.sora_client.check_username_available(username, token)
+        if is_available:
+            debug_logger.log_info(f"Username '{username}' is available")
+            return username
+
+        # If not available, try adding random suffix
+        for attempt in range(max_retries):
+            random_suffix = str(random.randint(100, 999))
+            new_username = f"{username}{random_suffix}"
+            is_available = await self.sora_client.check_username_available(new_username, token)
+            if is_available:
+                debug_logger.log_info(f"Username '{username}' not available, using '{new_username}' instead")
+                return new_username
+            debug_logger.log_info(f"Username '{new_username}' not available, retrying... ({attempt + 1}/{max_retries})")
+
+        # If all retries failed, use timestamp-based username
+        timestamp_suffix = str(int(time.time()))[-6:]
+        final_username = f"{username}{timestamp_suffix}"
+        debug_logger.log_info(f"All retries failed, using timestamp-based username: {final_username}")
+        return final_username
+
     def _clean_remix_link_from_prompt(self, prompt: str) -> str:
         """Remove remix link from prompt
 
@@ -291,7 +511,7 @@ class GenerationHandler:
 
         kwargs = {
             "timeout": 30,
-            "impersonate": "chrome"
+            "impersonate": get_random_fingerprint()
         }
 
         if proxy_url:
@@ -320,7 +540,10 @@ class GenerationHandler:
                                image: Optional[str] = None,
                                video: Optional[str] = None,
                                remix_target_id: Optional[str] = None,
-                               stream: bool = True) -> AsyncGenerator[str, None]:
+                               stream: bool = True,
+                               character_options: Optional[CharacterOptions] = None,
+                               style_id: Optional[str] = None,
+                               use_pending_v1: bool = False) -> AsyncGenerator[str, None]:
         """Handle generation request
 
         Args:
@@ -330,6 +553,9 @@ class GenerationHandler:
             video: Base64 encoded video or video URL
             remix_target_id: Sora share link video ID for remix
             stream: Whether to stream response
+            character_options: Optional character creation options
+            style_id: Optional video style (festive, retro, news, selfie, handheld, anime, comic, golden, vintage)
+            use_pending_v1: If True, use /nf/pending (v1) for polling instead of /nf/pending/v2
         """
         start_time = time.time()
         log_id = None  # Initialize log_id to avoid reference before assignment
@@ -375,12 +601,12 @@ class GenerationHandler:
 
                 # If no prompt, just create character and return
                 if not prompt:
-                    async for chunk in self._handle_character_creation_only(video_data, model_config):
+                    async for chunk in self._handle_character_creation_only(video_data, model_config, character_options):
                         yield chunk
                     return
                 else:
                     # If prompt provided, create character and generate video
-                    async for chunk in self._handle_character_and_video_generation(video_data, prompt, model_config):
+                    async for chunk in self._handle_character_and_video_generation(video_data, prompt, model_config, character_options):
                         yield chunk
                     return
 
@@ -423,6 +649,7 @@ class GenerationHandler:
                 raise Exception(f"Failed to acquire concurrency slot for token {token_obj.id}")
 
         task_id = None
+        log_id = None  # Log ID for updating later
         is_first_chunk = True  # Track if this is the first chunk
 
         try:
@@ -431,7 +658,9 @@ class GenerationHandler:
             if image:
                 if stream:
                     yield self._format_stream_chunk(
-                        reasoning_content="**Image Upload Begins**\n\nUploading image to server...\n",
+                        reasoning_content="Uploading image to server...",
+                        stage="upload",
+                        status="started",
                         is_first=is_first_chunk
                     )
                     is_first_chunk = False
@@ -441,20 +670,26 @@ class GenerationHandler:
 
                 if stream:
                     yield self._format_stream_chunk(
-                        reasoning_content="Image uploaded successfully. Proceeding to generation...\n"
+                        reasoning_content="Image uploaded successfully. Proceeding to generation...",
+                        stage="upload",
+                        status="completed"
                     )
 
             # Generate
             if stream:
                 if is_first_chunk:
                     yield self._format_stream_chunk(
-                        reasoning_content="**Generation Process Begins**\n\nInitializing generation request...\n",
+                        reasoning_content="Initializing generation request...",
+                        stage="generation",
+                        status="started",
                         is_first=True
                     )
                     is_first_chunk = False
                 else:
                     yield self._format_stream_chunk(
-                        reasoning_content="**Generation Process Begins**\n\nInitializing generation request...\n"
+                        reasoning_content="Initializing generation request...",
+                        stage="generation",
+                        status="started"
                     )
             
             if is_video:
@@ -469,7 +704,9 @@ class GenerationHandler:
                     # Storyboard mode
                     if stream:
                         yield self._format_stream_chunk(
-                            reasoning_content="Detected storyboard format. Converting to storyboard API format...\n"
+                            reasoning_content="Detected storyboard format. Converting to storyboard API format...",
+                            stage="storyboard",
+                            status="processing"
                         )
 
                     formatted_prompt = self.sora_client.format_storyboard_prompt(clean_prompt)
@@ -494,9 +731,8 @@ class GenerationHandler:
                         media_id=media_id,
                         n_frames=n_frames,
                         style_id=style_id,
-                        model=sora_model,
-                        size=video_size,
-                        token_id=token_obj.id
+                        model=model_config.get("model", "sy_8"),
+                        size=model_config.get("size", "small")
                     )
             else:
                 task_id = await self.sora_client.generate_image(
@@ -518,26 +754,116 @@ class GenerationHandler:
             )
             await self.db.create_task(task)
 
-            # Create initial log entry (status_code=-1, duration=-1.0 means in-progress)
-            log_id = await self._log_request(
+            # Log request start (in-progress)
+            log_id = await self._log_request_start(
                 token_obj.id,
+                task_id,
                 f"generate_{model_config['type']}",
-                {"model": model, "prompt": prompt, "has_image": image is not None},
-                {},  # Empty response initially
-                -1,  # -1 means in-progress
-                -1.0,  # -1.0 means in-progress
-                task_id=task_id
+                {"model": model, "prompt": prompt, "has_image": image is not None}
             )
 
             # Record usage
             await self.token_manager.record_usage(token_obj.id, is_video=is_video)
             
             # Poll for results with timeout
-            async for chunk in self._poll_task_result(task_id, token_obj.token, is_video, stream, prompt, token_obj.id):
-                yield chunk
-            
-            # Record success
-            await self.token_manager.record_success(token_obj.id, is_video=is_video)
+            generation_completed = False
+            try:
+                async for chunk in self._poll_task_result(task_id, token_obj.token, is_video, stream, prompt, token_obj.id, use_pending_v1):
+                    yield chunk
+                generation_completed = True
+            except GeneratorExit:
+                # Client disconnected during streaming
+                # Check if task was actually completed by checking database
+                task_data = await self.db.get_task(task_id)
+                if task_data and task_data.status == "completed":
+                    generation_completed = True
+                    debug_logger.log_info(f"Client disconnected but task {task_id} was completed")
+                    # Update log immediately since finally block may not execute properly during GeneratorExit
+                    try:
+                        duration = time.time() - start_time
+                        await self._log_request_complete(
+                            log_id,
+                            {"task_id": task_id, "status": "success"},
+                            200,
+                            duration
+                        )
+                        await self.token_manager.record_success(token_obj.id, is_video=is_video)
+                    except Exception as log_error:
+                        debug_logger.log_info(f"Failed to update log during GeneratorExit: {log_error}")
+                else:
+                    debug_logger.log_info(f"Client disconnected, task {task_id} status: {task_data.status if task_data else 'unknown'}")
+                    # Mark task as cancelled and update request log for client disconnect
+                    try:
+                        await self.db.update_task(task_id, "cancelled", 0, error_message="Client disconnected")
+                        await self.db.update_request_log_by_task_id(
+                            task_id,
+                            response_body=json.dumps({"error": "Client disconnected"}),
+                            status_code=499,
+                            duration=time.time() - start_time
+                        )
+                    except Exception as log_error:
+                        debug_logger.log_info(f"Failed to update cancellation state: {log_error}")
+
+                    # Release resources so tokens don't get stuck
+                    if is_image:
+                        await self.load_balancer.token_lock.release_lock(token_obj.id)
+                        if self.concurrency_manager:
+                            await self.concurrency_manager.release_image(token_obj.id)
+                    if is_video and self.concurrency_manager:
+                        await self.concurrency_manager.release_video(token_obj.id)
+                raise
+            except asyncio.CancelledError:
+                # Client disconnected/cancelled request (async cancellation)
+                task_data = await self.db.get_task(task_id)
+                if task_data and task_data.status == "completed":
+                    generation_completed = True
+                    debug_logger.log_info(f"Request cancelled but task {task_id} was completed")
+                    try:
+                        duration = time.time() - start_time
+                        await self._log_request_complete(
+                            log_id,
+                            {"task_id": task_id, "status": "success"},
+                            200,
+                            duration
+                        )
+                        await self.token_manager.record_success(token_obj.id, is_video=is_video)
+                    except Exception as log_error:
+                        debug_logger.log_info(f"Failed to update log during cancellation: {log_error}")
+                else:
+                    debug_logger.log_info(f"Request cancelled, task {task_id} status: {task_data.status if task_data else 'unknown'}")
+                    try:
+                        await self.db.update_task(task_id, "cancelled", 0, error_message="Client disconnected")
+                        await self.db.update_request_log_by_task_id(
+                            task_id,
+                            response_body=json.dumps({"error": "Client disconnected"}),
+                            status_code=499,
+                            duration=time.time() - start_time
+                        )
+                    except Exception as log_error:
+                        debug_logger.log_info(f"Failed to update cancellation state: {log_error}")
+
+                    if is_image:
+                        await self.load_balancer.token_lock.release_lock(token_obj.id)
+                        if self.concurrency_manager:
+                            await self.concurrency_manager.release_image(token_obj.id)
+                    if is_video and self.concurrency_manager:
+                        await self.concurrency_manager.release_video(token_obj.id)
+                raise
+            finally:
+                # Always update log and stats when generation completes successfully
+                # Skip if already updated in GeneratorExit handler
+                if generation_completed and not isinstance(sys.exc_info()[1], GeneratorExit):
+                    # Record success
+                    await self.token_manager.record_success(token_obj.id, is_video=is_video)
+
+                    # Update log with success
+                    duration = time.time() - start_time
+                    await self._log_request_complete(
+                        log_id,
+                        {"task_id": task_id, "status": "success"},
+                        200,
+                        duration
+                    )
 
             # Release lock for image generation
             if is_image:
@@ -550,35 +876,9 @@ class GenerationHandler:
             if is_video and self.concurrency_manager:
                 await self.concurrency_manager.release_video(token_obj.id)
 
-            # Log successful request with complete task info
-            duration = time.time() - start_time
-
-            # Get complete task info from database
-            task_info = await self.db.get_task(task_id)
-            response_data = {
-                "task_id": task_id,
-                "status": "success",
-                "prompt": prompt,
-                "model": model
-            }
-
-            # Add result_urls if available
-            if task_info and task_info.result_urls:
-                try:
-                    result_urls = json.loads(task_info.result_urls)
-                    response_data["result_urls"] = result_urls
-                except:
-                    response_data["result_urls"] = task_info.result_urls
-
-            # Update log entry with completion data
-            if log_id:
-                await self.db.update_request_log(
-                    log_id,
-                    response_body=json.dumps(response_data),
-                    status_code=200,
-                    duration=duration
-                )
-
+        except GeneratorExit:
+            # Re-raise GeneratorExit to allow proper cleanup
+            raise
         except Exception as e:
             # Release lock for image generation on error
             if is_image and token_obj:
@@ -597,57 +897,67 @@ class GenerationHandler:
                 is_overload = "heavy_load" in error_str or "under heavy load" in error_str
                 await self.token_manager.record_error(token_obj.id, is_overload=is_overload)
 
-            # Parse error message to check if it's a structured error (JSON)
-            error_response = None
-            try:
-                import json
-                error_response = json.loads(str(e))
-            except:
-                pass
-
-            # Update log entry with error data
+            # Update log with failure
             duration = time.time() - start_time
-            if log_id:
-                if error_response:
-                    # Structured error (e.g., unsupported_country_code)
-                    await self.db.update_request_log(
-                        log_id,
-                        response_body=json.dumps(error_response),
-                        status_code=400,
-                        duration=duration
-                    )
-                else:
-                    # Generic error
-                    await self.db.update_request_log(
-                        log_id,
-                        response_body=json.dumps({"error": str(e)}),
-                        status_code=500,
-                        duration=duration
-                    )
+            if 'log_id' in dir():
+                await self._log_request_complete(
+                    log_id,
+                    {"error": str(e)},
+                    500,
+                    duration
+                )
+            else:
+                # Fallback if log_id wasn't created (e.g., error before task creation)
+                await self._log_request(
+                    token_obj.id if token_obj else None,
+                    f"generate_{model_config['type'] if model_config else 'unknown'}",
+                    {"model": model, "prompt": prompt, "has_image": image is not None},
+                    {"error": str(e)},
+                    500,
+                    duration
+                )
             raise e
     
     async def _poll_task_result(self, task_id: str, token: str, is_video: bool,
-                                stream: bool, prompt: str, token_id: int = None) -> AsyncGenerator[str, None]:
-        """Poll for task result with timeout"""
+                                stream: bool, prompt: str, token_id: int = None,
+                                use_pending_v1: bool = False) -> AsyncGenerator[str, None]:
+        """Poll for task result with timeout
+
+        Args:
+            use_pending_v1: If True, use /nf/pending (v1) for polling instead of /nf/pending/v2
+
+        This method uses adaptive polling intervals based on task progress:
+        - 5s when progress < 30%
+        - 3s when 30% <= progress < 70%
+        - 2s when progress >= 70%
+        - Interval increases by 50% when no progress change for 3 consecutive polls
+
+        Requirements: 1.1, 1.2, 1.3, 1.4, 1.5
+        """
         # Get timeout from config
         timeout = config.video_timeout if is_video else config.image_timeout
-        poll_interval = config.poll_interval
-        max_attempts = int(timeout / poll_interval)  # Calculate max attempts based on timeout
+
+        # Initialize adaptive poller for video generation
+        # For image generation, we use a simpler approach since progress updates are less frequent
+        adaptive_poller = AdaptivePoller() if is_video else None
+        base_poll_interval = config.poll_interval  # Fallback for image generation
+
         last_progress = 0
         start_time = time.time()
         last_heartbeat_time = start_time  # Track last heartbeat for image generation
         heartbeat_interval = 10  # Send heartbeat every 10 seconds for image generation
         last_status_output_time = start_time  # Track last status output time for video generation
         video_status_interval = 30  # Output status every 30 seconds for video generation
+        post_link_emitted = False
 
-        debug_logger.log_info(f"Starting task polling: task_id={task_id}, is_video={is_video}, timeout={timeout}s, max_attempts={max_attempts}")
+        debug_logger.log_info(f"Starting task polling: task_id={task_id}, is_video={is_video}, timeout={timeout}s, adaptive_polling={'enabled' if is_video else 'disabled'}")
 
         # Check and log watermark-free mode status at the beginning
         if is_video:
             watermark_free_config = await self.db.get_watermark_free_config()
             debug_logger.log_info(f"Watermark-free mode: {'ENABLED' if watermark_free_config.watermark_free_enabled else 'DISABLED'}")
 
-        for attempt in range(max_attempts):
+        while True:
             # Check if timeout exceeded
             elapsed_time = time.time() - start_time
             if elapsed_time > timeout:
@@ -671,15 +981,33 @@ class GenerationHandler:
                     debug_logger.log_info(f"Released concurrency slot for token {token_id} due to timeout")
 
                 await self.db.update_task(task_id, "failed", 0, error_message=f"Generation timeout after {elapsed_time:.1f} seconds")
+                await self.db.update_request_log_by_task_id(
+                    task_id,
+                    response_body=json.dumps({
+                        "error": f"Generation timeout after {elapsed_time:.1f} seconds"
+                    }),
+                    status_code=408,
+                    duration=elapsed_time
+                )
                 raise Exception(f"Upstream API timeout: Generation exceeded {timeout} seconds limit")
 
+            # Get adaptive polling interval for video, or use base interval for image
+            if is_video and adaptive_poller:
+                poll_interval = adaptive_poller.get_interval(last_progress)
+                if adaptive_poller.is_stalled():
+                    debug_logger.log_info(f"Task {task_id} stall detected, using extended interval: {poll_interval}s")
+            else:
+                poll_interval = base_poll_interval
 
             await asyncio.sleep(poll_interval)
 
             try:
                 if is_video:
                     # Get pending tasks to check progress
-                    pending_tasks = await self.sora_client.get_pending_tasks(token, token_id=token_id)
+                    if use_pending_v1:
+                        pending_tasks = await self.sora_client.get_pending_tasks(token, token_id=token_id)
+                    else:
+                        pending_tasks = await self.sora_client.get_pending_tasks_v2(token)
 
                     # Find matching task in pending tasks
                     task_found = False
@@ -694,17 +1022,30 @@ class GenerationHandler:
                             else:
                                 progress_pct = int(progress_pct * 100)
 
-                            # Update last_progress for tracking
-                            last_progress = progress_pct
                             status = task.get("status", "processing")
 
-                            # Output status every 30 seconds (not just when progress changes)
+                            # Record progress for adaptive polling (stall detection)
+                            # Requirements: 1.5 - detect stall when no progress for 3 consecutive polls
+                            if adaptive_poller:
+                                adaptive_poller.record_progress(progress_pct)
+
+                            # Output progress when it changes (at least 1% difference) or every 30 seconds
                             current_time = time.time()
-                            if stream and (current_time - last_status_output_time >= video_status_interval):
+                            progress_changed = progress_pct > last_progress
+                            time_elapsed = current_time - last_status_output_time >= video_status_interval
+
+                            if stream and (progress_changed or time_elapsed):
                                 last_status_output_time = current_time
-                                debug_logger.log_info(f"Task {task_id} progress: {progress_pct}% (status: {status})")
+                                last_progress = progress_pct
+                                # Include adaptive polling info in debug log
+                                interval_info = f", next_interval={adaptive_poller.get_interval(progress_pct)}s" if adaptive_poller else ""
+                                debug_logger.log_info(f"Task {task_id} progress: {progress_pct}% (status: {status}{interval_info})")
                                 yield self._format_stream_chunk(
-                                    reasoning_content=f"**Video Generation Progress**: {progress_pct}% ({status})\n"
+                                    reasoning_content=f"Video generation progress: {progress_pct}%",
+                                    stage="generation",
+                                    status="processing",
+                                    progress=progress_pct,
+                                    details={"task_status": status}
                                 )
                             break
 
@@ -721,6 +1062,28 @@ class GenerationHandler:
                                 kind = item.get("kind")
                                 reason_str = item.get("reason_str") or item.get("markdown_reason_str")
                                 url = item.get("url") or item.get("downloadable_url")
+
+                                # Best-effort: derive post_id + permalink for the Sora post/share page.
+                                post_id = item.get("post_id")
+                                if not post_id:
+                                    attachment_id = item.get("id")
+                                    if isinstance(attachment_id, str) and "-attachment-" in attachment_id:
+                                        post_id = attachment_id.split("-attachment-", 1)[0]
+
+                                permalink = item.get("permalink")
+                                if not permalink and isinstance(post_id, str) and post_id.startswith("s_"):
+                                    permalink = f"https://sora.chatgpt.com/p/{post_id}"
+
+                                # Emit permalink early when available (useful for clients that want the share link).
+                                if stream and isinstance(permalink, str) and permalink and not post_link_emitted:
+                                    post_link_emitted = True
+                                    yield self._format_stream_chunk(
+                                        reasoning_content="Post created. Share link available.",
+                                        stage="generation",
+                                        status="processing",
+                                        details={"permalink": permalink}
+                                    )
+
                                 debug_logger.log_info(f"Found task {task_id} in drafts with kind: {kind}, reason_str: {reason_str}, has_url: {bool(url)}")
 
                                 # Check if content violates policy
@@ -742,6 +1105,12 @@ class GenerationHandler:
 
                                     # Update task status
                                     await self.db.update_task(task_id, "failed", 0, error_message=error_message)
+                                    await self.db.update_request_log_by_task_id(
+                                        task_id,
+                                        response_body=json.dumps({"error": error_message}),
+                                        status_code=400,
+                                        duration=time.time() - start_time
+                                    )
 
                                     # Release resources
                                     if token_id and self.concurrency_manager:
@@ -751,10 +1120,16 @@ class GenerationHandler:
                                     # Return error in stream format
                                     if stream:
                                         yield self._format_stream_chunk(
-                                            reasoning_content=f"**Content Policy Violation**\n\n{reason_str}\n"
+                                            reasoning_content=f"Content policy violation: {reason_str}",
+                                            stage="error",
+                                            status="error",
+                                            details={"error_type": "content_policy_violation", "reason": reason_str}
                                         )
                                         yield self._format_stream_chunk(
-                                            content=f"❌ 生成失败: {reason_str}",
+                                            content=self._format_result_content(
+                                                result_type="error",
+                                                error=reason_str or "Content violates guardrails"
+                                            ),
                                             finish_reason="STOP"
                                         )
                                         yield "data: [DONE]\n\n"
@@ -776,7 +1151,9 @@ class GenerationHandler:
 
                                     if stream:
                                         yield self._format_stream_chunk(
-                                            reasoning_content="**Video Generation Completed**\n\nWatermark-free mode enabled. Publishing video to get watermark-free version...\n"
+                                            reasoning_content="Watermark-free mode enabled. Publishing video to get watermark-free version...",
+                                            stage="watermark_free",
+                                            status="started"
                                         )
 
                                     # Get watermark-free config to determine parse method
@@ -796,6 +1173,8 @@ class GenerationHandler:
                                         if not post_id:
                                             raise Exception("Failed to get post ID from publish API")
 
+                                        permalink = f"https://sora.chatgpt.com/p/{post_id}"
+
                                         # Get watermark-free video URL based on parse method
                                         if parse_method == "custom":
                                             # Use custom parse server
@@ -804,7 +1183,10 @@ class GenerationHandler:
 
                                             if stream:
                                                 yield self._format_stream_chunk(
-                                                    reasoning_content=f"Video published successfully. Post ID: {post_id}\nUsing custom parse server to get watermark-free URL...\n"
+                                                    reasoning_content=f"Video published successfully. Using custom parse server to get watermark-free URL...",
+                                                    stage="watermark_free",
+                                                    status="processing",
+                                                    details={"permalink": permalink, "parse_method": "custom"}
                                                 )
 
                                             debug_logger.log_info(f"Using custom parse server: {watermark_config.custom_parse_url}")
@@ -822,7 +1204,10 @@ class GenerationHandler:
 
                                         if stream:
                                             yield self._format_stream_chunk(
-                                                reasoning_content=f"Video published successfully. Post ID: {post_id}\nNow {'caching' if config.cache_enabled else 'preparing'} watermark-free video...\n"
+                                                reasoning_content=f"Video published successfully. Now {'caching' if config.cache_enabled else 'preparing'} watermark-free video...",
+                                                stage="watermark_free",
+                                                status="processing",
+                                                details={"permalink": permalink, "cache_enabled": config.cache_enabled}
                                             )
 
                                         # Cache watermark-free video (if cache enabled)
@@ -832,7 +1217,9 @@ class GenerationHandler:
                                                 local_url = f"{self._get_base_url()}/tmp/{cached_filename}"
                                                 if stream:
                                                     yield self._format_stream_chunk(
-                                                        reasoning_content="Watermark-free video cached successfully. Preparing final response...\n"
+                                                        reasoning_content="Watermark-free video cached successfully. Preparing final response...",
+                                                        stage="cache",
+                                                        status="completed"
                                                     )
 
                                                 # Delete the published post after caching
@@ -900,7 +1287,11 @@ class GenerationHandler:
                                         if config.cache_enabled:
                                             if stream:
                                                 yield self._format_stream_chunk(
-                                                    reasoning_content="**Video Generation Completed**\n\nVideo generation successful. Now caching the video file...\n"
+                                                    reasoning_content="Video generation successful. Now caching the video file...",
+                                                    stage="cache",
+                                                    status="started",
+                                                    progress=100,
+                                                    details={"cache_enabled": True}
                                                 )
 
                                             try:
@@ -908,21 +1299,29 @@ class GenerationHandler:
                                                 local_url = f"{self._get_base_url()}/tmp/{cached_filename}"
                                                 if stream:
                                                     yield self._format_stream_chunk(
-                                                        reasoning_content="Video file cached successfully. Preparing final response...\n"
+                                                        reasoning_content="Video file cached successfully. Preparing final response...",
+                                                        stage="cache",
+                                                        status="completed"
                                                     )
                                             except Exception as cache_error:
                                                 # Fallback to original URL if caching fails
                                                 local_url = url
                                                 if stream:
                                                     yield self._format_stream_chunk(
-                                                        reasoning_content=f"Warning: Failed to cache file - {str(cache_error)}\nUsing original URL instead...\n"
+                                                        reasoning_content=f"Warning: Failed to cache file - {str(cache_error)}. Using original URL instead...",
+                                                        stage="cache",
+                                                        status="error",
+                                                        details={"error": str(cache_error)}
                                                     )
                                         else:
                                             # Cache disabled: use original URL directly
                                             local_url = url
                                             if stream:
                                                 yield self._format_stream_chunk(
-                                                    reasoning_content="**Video Generation Completed**\n\nCache is disabled. Using original URL directly...\n"
+                                                    reasoning_content="Video generation completed. Cache is disabled, using original URL directly...",
+                                                    stage="generation",
+                                                    status="completed",
+                                                    progress=100
                                                 )
 
                                 # Task completed
@@ -930,11 +1329,21 @@ class GenerationHandler:
                                     task_id, "completed", 100.0,
                                     result_urls=json.dumps([local_url])
                                 )
+                                await self.db.update_request_log_by_task_id(
+                                    task_id,
+                                    response_body=json.dumps({"task_id": task_id, "status": "success"}),
+                                    status_code=200,
+                                    duration=time.time() - start_time
+                                )
 
                                 if stream:
-                                    # Final response with content
+                                    # Final response with structured content
                                     yield self._format_stream_chunk(
-                                        content=f"```html\n<video src='{local_url}' controls></video>\n```",
+                                        content=self._format_result_content(
+                                            result_type="video",
+                                            url=local_url,
+                                            permalink=permalink
+                                        ),
                                         finish_reason="STOP"
                                     )
                                     yield "data: [DONE]\n\n"
@@ -952,15 +1361,25 @@ class GenerationHandler:
                             progress = task_resp.get("progress_pct", 0) * 100
 
                             if status == "succeeded":
-                                # Extract URLs
+                                # Extract URLs and clean trailing parentheses
                                 generations = task_resp.get("generations", [])
-                                urls = [gen.get("url") for gen in generations if gen.get("url")]
+                                urls = []
+                                for gen in generations:
+                                    url = gen.get("url")
+                                    if url:
+                                        # Remove trailing ) that may be incorrectly included in the URL
+                                        url = url.rstrip(')')
+                                        urls.append(url)
 
                                 if urls:
                                     # Cache image files
                                     if stream:
                                         yield self._format_stream_chunk(
-                                            reasoning_content=f"**Image Generation Completed**\n\nImage generation successful. Now caching {len(urls)} image(s)...\n"
+                                            reasoning_content=f"Image generation successful. Now caching {len(urls)} image(s)...",
+                                            stage="cache",
+                                            status="started",
+                                            progress=100,
+                                            details={"image_count": len(urls)}
                                         )
 
                                     base_url = self._get_base_url()
@@ -975,38 +1394,57 @@ class GenerationHandler:
                                                 local_urls.append(local_url)
                                                 if stream and len(urls) > 1:
                                                     yield self._format_stream_chunk(
-                                                        reasoning_content=f"Cached image {idx + 1}/{len(urls)}...\n"
+                                                        reasoning_content=f"Cached image {idx + 1}/{len(urls)}...",
+                                                        stage="cache",
+                                                        status="processing",
+                                                        details={"current": idx + 1, "total": len(urls)}
                                                     )
                                             except Exception as cache_error:
                                                 # Fallback to original URL if caching fails
                                                 local_urls.append(url)
                                                 if stream:
                                                     yield self._format_stream_chunk(
-                                                        reasoning_content=f"Warning: Failed to cache image {idx + 1} - {str(cache_error)}\nUsing original URL instead...\n"
+                                                        reasoning_content=f"Warning: Failed to cache image {idx + 1} - {str(cache_error)}. Using original URL instead...",
+                                                        stage="cache",
+                                                        status="error",
+                                                        details={"image_index": idx + 1, "error": str(cache_error)}
                                                     )
 
                                         if stream and all(u.startswith(base_url) for u in local_urls):
                                             yield self._format_stream_chunk(
-                                                reasoning_content="All images cached successfully. Preparing final response...\n"
+                                                reasoning_content="All images cached successfully. Preparing final response...",
+                                                stage="cache",
+                                                status="completed"
                                             )
                                     else:
                                         # Cache disabled: use original URLs directly
                                         local_urls = urls
                                         if stream:
                                             yield self._format_stream_chunk(
-                                                reasoning_content="Cache is disabled. Using original URLs directly...\n"
+                                                reasoning_content="Image generation completed. Cache is disabled, using original URLs directly...",
+                                                stage="generation",
+                                                status="completed",
+                                                progress=100
                                             )
 
                                     await self.db.update_task(
                                         task_id, "completed", 100.0,
                                         result_urls=json.dumps(local_urls)
                                     )
+                                    await self.db.update_request_log_by_task_id(
+                                        task_id,
+                                        response_body=json.dumps({"task_id": task_id, "status": "success"}),
+                                        status_code=200,
+                                        duration=time.time() - start_time
+                                    )
 
                                     if stream:
-                                        # Final response with content (Markdown format)
-                                        content_markdown = "\n".join([f"![Generated Image]({url})" for url in local_urls])
+                                        # Final response with structured content
                                         yield self._format_stream_chunk(
-                                            content=content_markdown,
+                                            content=self._format_result_content(
+                                                result_type="image",
+                                                urls=local_urls
+                                            ),
                                             finish_reason="STOP"
                                         )
                                         yield "data: [DONE]\n\n"
@@ -1015,6 +1453,12 @@ class GenerationHandler:
                             elif status == "failed":
                                 error_msg = task_resp.get("error_message", "Generation failed")
                                 await self.db.update_task(task_id, "failed", progress, error_message=error_msg)
+                                await self.db.update_request_log_by_task_id(
+                                    task_id,
+                                    response_body=json.dumps({"error": error_msg}),
+                                    status_code=500,
+                                    duration=time.time() - start_time
+                                )
                                 raise Exception(error_msg)
 
                             elif status == "processing":
@@ -1025,7 +1469,10 @@ class GenerationHandler:
 
                                     if stream:
                                         yield self._format_stream_chunk(
-                                            reasoning_content=f"**Processing**\n\nGeneration in progress: {progress:.0f}% completed...\n"
+                                            reasoning_content=f"Image generation in progress: {progress:.0f}% completed...",
+                                            stage="generation",
+                                            status="processing",
+                                            progress=progress
                                         )
 
                     # For image generation, send heartbeat every 10 seconds if no progress update
@@ -1035,7 +1482,10 @@ class GenerationHandler:
                             last_heartbeat_time = current_time
                             elapsed = int(current_time - start_time)
                             yield self._format_stream_chunk(
-                                reasoning_content=f"Image generation in progress... ({elapsed}s elapsed)\n"
+                                reasoning_content=f"Image generation in progress... ({elapsed}s elapsed)",
+                                stage="generation",
+                                status="processing",
+                                details={"elapsed_seconds": elapsed}
                             )
 
                     # If task not found in response, send heartbeat for image generation
@@ -1045,49 +1495,64 @@ class GenerationHandler:
                             last_heartbeat_time = current_time
                             elapsed = int(current_time - start_time)
                             yield self._format_stream_chunk(
-                                reasoning_content=f"Image generation in progress... ({elapsed}s elapsed)\n"
+                                reasoning_content=f"Image generation in progress... ({elapsed}s elapsed)",
+                                stage="generation",
+                                status="processing",
+                                details={"elapsed_seconds": elapsed}
                             )
 
                 # Progress update for stream mode (fallback if no status from API)
-                if stream and attempt % 10 == 0:  # Update every 10 attempts (roughly 20% intervals)
-                    estimated_progress = min(90, (attempt / max_attempts) * 100)
-                    if estimated_progress > last_progress + 20:  # Update every 20%
-                        last_progress = estimated_progress
-                        yield self._format_stream_chunk(
-                            reasoning_content=f"**Processing**\n\nGeneration in progress: {estimated_progress:.0f}% completed (estimated)...\n"
-                        )
+                # Note: With adaptive polling, we rely on actual progress updates rather than attempt counts
             
             except Exception as e:
-                if attempt >= max_attempts - 1:
-                    raise e
+                # Log the error but continue polling (timeout check at loop start will handle termination)
+                debug_logger.log_info(f"Polling error for task {task_id}: {str(e)}, continuing...")
                 continue
 
-        # Timeout - release lock if image generation
+        # This point should not be reached due to timeout check at loop start
+        # But keep as safety net
         if not is_video and token_id:
             await self.load_balancer.token_lock.release_lock(token_id)
-            debug_logger.log_info(f"Released lock for token {token_id} due to max attempts reached")
+            debug_logger.log_info(f"Released lock for token {token_id} due to unexpected loop exit")
             # Release concurrency slot for image generation
             if self.concurrency_manager:
                 await self.concurrency_manager.release_image(token_id)
-                debug_logger.log_info(f"Released concurrency slot for token {token_id} due to max attempts reached")
+                debug_logger.log_info(f"Released concurrency slot for token {token_id} due to unexpected loop exit")
 
         # Release concurrency slot for video generation
         if is_video and token_id and self.concurrency_manager:
             await self.concurrency_manager.release_video(token_id)
-            debug_logger.log_info(f"Released concurrency slot for token {token_id} due to max attempts reached")
+            debug_logger.log_info(f"Released concurrency slot for token {token_id} due to unexpected loop exit")
 
         await self.db.update_task(task_id, "failed", 0, error_message=f"Generation timeout after {timeout} seconds")
+        await self.db.update_request_log_by_task_id(
+            task_id,
+            response_body=json.dumps({
+                "error": f"Generation timeout after {timeout} seconds"
+            }),
+            status_code=408,
+            duration=time.time() - start_time
+        )
         raise Exception(f"Upstream API timeout: Generation exceeded {timeout} seconds limit")
     
     def _format_stream_chunk(self, content: str = None, reasoning_content: str = None,
-                            finish_reason: str = None, is_first: bool = False) -> str:
-        """Format streaming response chunk
+                            finish_reason: str = None, is_first: bool = False,
+                            stage: str = None, status: str = None, progress: float = None,
+                            details: Dict[str, Any] = None) -> str:
+        """Format streaming response chunk with structured reasoning_content
 
         Args:
             content: Final response content (for user-facing output)
-            reasoning_content: Thinking/reasoning process content
+            reasoning_content: Thinking/reasoning process content (legacy text format, will be converted to structured)
             finish_reason: Finish reason (e.g., "STOP")
             is_first: Whether this is the first chunk (includes role)
+            stage: Current processing stage (e.g., "upload", "generation", "cache", "character_creation")
+            status: Current status (e.g., "started", "processing", "completed", "error")
+            progress: Progress percentage (0-100)
+            details: Additional details as a dictionary
+
+        Returns:
+            Formatted SSE data string
         """
         chunk_id = f"chatcmpl-{int(datetime.now().timestamp() * 1000)}"
 
@@ -1097,18 +1562,25 @@ class GenerationHandler:
         if is_first:
             delta["role"] = "assistant"
 
-        # Add content fields
+        # Add content fields - only include if not None
         if content is not None:
             delta["content"] = content
-        else:
-            delta["content"] = None
 
-        if reasoning_content is not None:
-            delta["reasoning_content"] = reasoning_content
-        else:
-            delta["reasoning_content"] = None
+        # Build reasoning_content as string (OpenAI API expects string type)
+        # Include progress and stage info in the message
+        if reasoning_content is not None or stage is not None:
+            message_parts = []
+            if stage:
+                message_parts.append(f"[{stage}]")
+            if status:
+                message_parts.append(f"({status})")
+            if progress is not None:
+                message_parts.append(f"{progress}%")
+            if reasoning_content:
+                message_parts.append(reasoning_content.strip())
 
-        delta["tool_calls"] = None
+            if message_parts:
+                delta["reasoning_content"] = " ".join(message_parts)
 
         response = {
             "id": chunk_id,
@@ -1118,20 +1590,92 @@ class GenerationHandler:
             "choices": [{
                 "index": 0,
                 "delta": delta,
-                "finish_reason": finish_reason,
-                "native_finish_reason": finish_reason
-            }],
-            "usage": {
-                "prompt_tokens": 0
-            }
+                "finish_reason": finish_reason
+            }]
         }
 
-        # Add completion tokens for final chunk
-        if finish_reason:
-            response["usage"]["completion_tokens"] = 1
-            response["usage"]["total_tokens"] = 1
+        return f'data: {json.dumps(response, ensure_ascii=False)}\n\n'
 
-        return f'data: {json.dumps(response)}\n\n'
+    def _format_result_content(self, result_type: str, urls: list = None, url: str = None,
+                                permalink: str = None,
+                                username: str = None, display_name: str = None,
+                                cameo_id: str = None, character_id: str = None,
+                                error: str = None) -> str:
+        """Format result content in Markdown format (compatible with original project)
+
+        Args:
+            result_type: Type of result ("image", "video", "character", "error")
+            urls: List of URLs (for images)
+            url: Single URL (for video)
+            permalink: Video permalink
+            username: Character username
+            display_name: Character display name
+            cameo_id: Character cameo ID
+            character_id: Character ID
+            error: Error message
+
+        Returns:
+            Markdown formatted string for display
+        """
+        if result_type == "image":
+            # Return Markdown image format: ![Generated Image](url)
+            if urls:
+                return "\n".join([f"![Generated Image]({u})" for u in urls])
+            return ""
+
+        elif result_type == "video":
+            # Return HTML video tag in code block (original project format)
+            return f"```html\n<video src='{url}' controls></video>\n```"
+
+        elif result_type == "character":
+            # Return character creation success message
+            return f"角色创建成功，角色名@{username}"
+
+        elif result_type == "error":
+            # Return error message
+            return f"❌ 生成失败: {error}"
+
+        return ""
+
+    def _infer_stage_from_message(self, message: str) -> str:
+        """Infer stage from reasoning message content"""
+        if not message:
+            return "unknown"
+        message_lower = message.lower()
+        if "upload" in message_lower:
+            return "upload"
+        elif "generation" in message_lower or "generating" in message_lower:
+            return "generation"
+        elif "cache" in message_lower or "caching" in message_lower:
+            return "cache"
+        elif "character" in message_lower or "cameo" in message_lower:
+            return "character_creation"
+        elif "remix" in message_lower:
+            return "remix"
+        elif "watermark" in message_lower or "publish" in message_lower:
+            return "watermark_free"
+        elif "progress" in message_lower:
+            return "progress"
+        elif "storyboard" in message_lower:
+            return "storyboard"
+        elif "policy" in message_lower or "violation" in message_lower:
+            return "error"
+        return "processing"
+
+    def _infer_status_from_message(self, message: str) -> str:
+        """Infer status from reasoning message content"""
+        if not message:
+            return "processing"
+        message_lower = message.lower()
+        if "begins" in message_lower or "initializing" in message_lower or "starting" in message_lower:
+            return "started"
+        elif "completed" in message_lower or "success" in message_lower or "finished" in message_lower:
+            return "completed"
+        elif "failed" in message_lower or "error" in message_lower or "warning" in message_lower or "violation" in message_lower:
+            return "error"
+        elif "progress" in message_lower or "processing" in message_lower or "in progress" in message_lower:
+            return "processing"
+        return "processing"
     
     def _format_non_stream_response(self, content: str, media_type: str = None, is_availability_check: bool = False) -> str:
         """Format non-streaming response
@@ -1164,10 +1708,49 @@ class GenerationHandler:
         }
         return json.dumps(response)
 
+    async def _log_request_start(self, token_id: Optional[int], task_id: str, operation: str,
+                                 request_data: Dict[str, Any]) -> Optional[int]:
+        """Log request start to database (in-progress status)
+
+        Returns the log ID for later update.
+        """
+        try:
+            log = RequestLog(
+                token_id=token_id,
+                task_id=task_id,
+                operation=operation,
+                request_body=json.dumps(request_data),
+                response_body=None,
+                status_code=-1,  # -1 indicates in-progress
+                duration=-1.0    # -1 indicates not completed
+            )
+            log_id = await self.db.log_request(log)
+            return log_id
+        except Exception as e:
+            # Don't fail the request if logging fails
+            print(f"Failed to log request start: {e}")
+            return None
+
+    async def _log_request_complete(self, log_id: Optional[int], response_data: Dict[str, Any],
+                                    status_code: int, duration: float):
+        """Update request log with completion data"""
+        if log_id is None:
+            return
+        try:
+            await self.db.update_request_log(
+                log_id,
+                response_body=json.dumps(response_data),
+                status_code=status_code,
+                duration=duration
+            )
+        except Exception as e:
+            # Don't fail the request if logging fails
+            print(f"Failed to update request log: {e}")
+
     async def _log_request(self, token_id: Optional[int], operation: str,
                           request_data: Dict[str, Any], response_data: Dict[str, Any],
-                          status_code: int, duration: float, task_id: Optional[str] = None) -> Optional[int]:
-        """Log request to database and return log ID"""
+                          status_code: int, duration: float):
+        """Log request to database (legacy method for backward compatibility)"""
         try:
             log = RequestLog(
                 token_id=token_id,
@@ -1186,18 +1769,24 @@ class GenerationHandler:
 
     # ==================== Character Creation and Remix Handlers ====================
 
-    async def _handle_character_creation_only(self, video_data, model_config: Dict) -> AsyncGenerator[str, None]:
+    async def _handle_character_creation_only(self, video_data, model_config: Dict,
+                                               character_options: Optional[CharacterOptions] = None) -> AsyncGenerator[str, None]:
         """Handle character creation only (no video generation)
 
         Flow:
         1. Download video if URL, or use bytes directly
-        2. Upload video to create character
+        2. Upload video to create character (with optional custom timestamps)
         3. Poll for character processing
         4. Download and cache avatar
         5. Upload avatar
-        6. Finalize character
+        6. Finalize character (with optional custom username, display_name, instruction_set, safety_instruction_set)
         7. Set character as public
         8. Return success message
+
+        Args:
+            video_data: Video bytes or URL
+            model_config: Model configuration
+            character_options: Optional custom character creation options
         """
         token_obj = await self.load_balancer.select_token(for_video_generation=True)
         if not token_obj:
@@ -1220,11 +1809,16 @@ class GenerationHandler:
             else:
                 video_bytes = video_data
 
+            # Get custom timestamps from character_options
+            custom_timestamps = character_options.timestamps if character_options else None
+
             # Step 1: Upload video
             yield self._format_stream_chunk(
                 reasoning_content="Uploading video file...\n"
             )
-            cameo_id = await self.sora_client.upload_character_video(video_bytes, token_obj.token)
+            cameo_id = await self.sora_client.upload_character_video(
+                video_bytes, token_obj.token, timestamps=custom_timestamps
+            )
             debug_logger.log_info(f"Video uploaded, cameo_id: {cameo_id}")
 
             # Step 2: Poll for character processing
@@ -1234,19 +1828,33 @@ class GenerationHandler:
             cameo_status = await self._poll_cameo_status(cameo_id, token_obj.token)
             debug_logger.log_info(f"Cameo status: {cameo_status}")
 
-            # Extract character info immediately after polling completes
-            username_hint = cameo_status.get("username_hint", "character")
-            display_name = cameo_status.get("display_name_hint", "Character")
+            # Extract character info - use custom values if provided, otherwise use API hints
+            if character_options and character_options.username:
+                username = character_options.username
+                debug_logger.log_info(f"Using custom username: {username}")
+            else:
+                username_hint = cameo_status.get("username_hint", "character")
+                # Process username: remove prefix and add 3 random digits
+                username = self._process_character_username(username_hint)
 
-            # Process username: remove prefix and add 3 random digits
-            username = self._process_character_username(username_hint)
+            if character_options and character_options.display_name:
+                display_name = character_options.display_name
+                debug_logger.log_info(f"Using custom display_name: {display_name}")
+            else:
+                display_name = cameo_status.get("display_name_hint", "Character")
 
-            # Output character name immediately
+            # Step 3: Check username availability and ensure it's available
             yield self._format_stream_chunk(
-                reasoning_content=f"✨ 角色已识别: {display_name} (@{username})\n"
+                reasoning_content="Checking username availability...\n"
+            )
+            username = await self._ensure_username_available(username, token_obj.token)
+
+            # Output character name
+            yield self._format_stream_chunk(
+                reasoning_content=f"{display_name} (@{username})\n"
             )
 
-            # Step 3: Download and cache avatar
+            # Step 4: Download and cache avatar
             yield self._format_stream_chunk(
                 reasoning_content="Downloading character avatar...\n"
             )
@@ -1257,19 +1865,30 @@ class GenerationHandler:
             avatar_data = await self.sora_client.download_character_image(profile_asset_url)
             debug_logger.log_info(f"Avatar downloaded, size: {len(avatar_data)} bytes")
 
-            # Step 4: Upload avatar
+            # Step 5: Upload avatar
             yield self._format_stream_chunk(
                 reasoning_content="Uploading character avatar...\n"
             )
             asset_pointer = await self.sora_client.upload_character_image(avatar_data, token_obj.token)
             debug_logger.log_info(f"Avatar uploaded, asset_pointer: {asset_pointer}")
 
-            # Step 5: Finalize character
+            # Step 6: Finalize character - use custom instruction_set and safety_instruction_set if provided
             yield self._format_stream_chunk(
                 reasoning_content="Finalizing character creation...\n"
             )
-            # instruction_set_hint is a string, but instruction_set in cameo_status might be an array
-            instruction_set = cameo_status.get("instruction_set_hint") or cameo_status.get("instruction_set")
+
+            # Determine instruction_set: custom > API hint > None
+            if character_options and character_options.instruction_set:
+                instruction_set = character_options.instruction_set
+                debug_logger.log_info(f"Using custom instruction_set")
+            else:
+                instruction_set = cameo_status.get("instruction_set_hint") or cameo_status.get("instruction_set")
+
+            # Determine safety_instruction_set: custom > None
+            safety_instruction_set = None
+            if character_options and character_options.safety_instruction_set:
+                safety_instruction_set = character_options.safety_instruction_set
+                debug_logger.log_info(f"Using custom safety_instruction_set")
 
             character_id = await self.sora_client.finalize_character(
                 cameo_id=cameo_id,
@@ -1277,11 +1896,12 @@ class GenerationHandler:
                 display_name=display_name,
                 profile_asset_pointer=asset_pointer,
                 instruction_set=instruction_set,
+                safety_instruction_set=safety_instruction_set,
                 token=token_obj.token
             )
             debug_logger.log_info(f"Character finalized, character_id: {character_id}")
 
-            # Step 6: Set character as public
+            # Step 7: Set character as public
             yield self._format_stream_chunk(
                 reasoning_content="Setting character as public...\n"
             )
@@ -1308,9 +1928,31 @@ class GenerationHandler:
                 duration=duration
             )
 
-            # Step 7: Return success message
+            # Step 8: Save character to database
+            character_record = Character(
+                cameo_id=cameo_id,
+                character_id=character_id,
+                token_id=token_obj.id,
+                username=username,
+                display_name=display_name,
+                profile_url=profile_asset_url,
+                instruction_set=json.dumps(instruction_set) if instruction_set else None,
+                safety_instruction_set=json.dumps(safety_instruction_set) if safety_instruction_set else None,
+                visibility="public",
+                status="finalized"
+            )
+            await self.db.create_character(character_record)
+            debug_logger.log_info(f"Character saved to database: cameo_id={cameo_id}")
+
+            # Step 9: Return success message - structured format
             yield self._format_stream_chunk(
-                content=f"角色创建成功，角色名@{username}",
+                content=self._format_result_content(
+                    result_type="character",
+                    username=username,
+                    display_name=display_name,
+                    cameo_id=cameo_id,
+                    character_id=character_id
+                ),
                 finish_reason="STOP"
             )
             yield "data: [DONE]\n\n"
@@ -1340,19 +1982,26 @@ class GenerationHandler:
             )
             raise
 
-    async def _handle_character_and_video_generation(self, video_data, prompt: str, model_config: Dict) -> AsyncGenerator[str, None]:
+    async def _handle_character_and_video_generation(self, video_data, prompt: str, model_config: Dict,
+                                                      character_options: Optional[CharacterOptions] = None) -> AsyncGenerator[str, None]:
         """Handle character creation and video generation
 
         Flow:
         1. Download video if URL, or use bytes directly
-        2. Upload video to create character
+        2. Upload video to create character (with optional custom timestamps)
         3. Poll for character processing
         4. Download and cache avatar
         5. Upload avatar
-        6. Finalize character
+        6. Finalize character (with optional custom username, display_name, instruction_set, safety_instruction_set)
         7. Generate video with character (@username + prompt)
         8. Delete character
         9. Return video result
+
+        Args:
+            video_data: Video bytes or URL
+            prompt: Generation prompt
+            model_config: Model configuration
+            character_options: Optional custom character creation options
         """
         token_obj = await self.load_balancer.select_token(for_video_generation=True)
         if not token_obj:
@@ -1379,11 +2028,16 @@ class GenerationHandler:
             else:
                 video_bytes = video_data
 
+            # Get custom timestamps from character_options
+            custom_timestamps = character_options.timestamps if character_options else None
+
             # Step 1: Upload video
             yield self._format_stream_chunk(
                 reasoning_content="Uploading video file...\n"
             )
-            cameo_id = await self.sora_client.upload_character_video(video_bytes, token_obj.token)
+            cameo_id = await self.sora_client.upload_character_video(
+                video_bytes, token_obj.token, timestamps=custom_timestamps
+            )
             debug_logger.log_info(f"Video uploaded, cameo_id: {cameo_id}")
 
             # Step 2: Poll for character processing
@@ -1393,19 +2047,33 @@ class GenerationHandler:
             cameo_status = await self._poll_cameo_status(cameo_id, token_obj.token)
             debug_logger.log_info(f"Cameo status: {cameo_status}")
 
-            # Extract character info immediately after polling completes
-            username_hint = cameo_status.get("username_hint", "character")
-            display_name = cameo_status.get("display_name_hint", "Character")
+            # Extract character info - use custom values if provided, otherwise use API hints
+            if character_options and character_options.username:
+                username = character_options.username
+                debug_logger.log_info(f"Using custom username: {username}")
+            else:
+                username_hint = cameo_status.get("username_hint", "character")
+                # Process username: remove prefix and add 3 random digits
+                username = self._process_character_username(username_hint)
 
-            # Process username: remove prefix and add 3 random digits
-            username = self._process_character_username(username_hint)
+            if character_options and character_options.display_name:
+                display_name = character_options.display_name
+                debug_logger.log_info(f"Using custom display_name: {display_name}")
+            else:
+                display_name = cameo_status.get("display_name_hint", "Character")
 
-            # Output character name immediately
+            # Step 3: Check username availability and ensure it's available
             yield self._format_stream_chunk(
-                reasoning_content=f"✨ 角色已识别: {display_name} (@{username})\n"
+                reasoning_content="Checking username availability...\n"
+            )
+            username = await self._ensure_username_available(username, token_obj.token)
+
+            # Output character name
+            yield self._format_stream_chunk(
+                reasoning_content=f"{display_name} (@{username})\n"
             )
 
-            # Step 3: Download and cache avatar
+            # Step 4: Download and cache avatar
             yield self._format_stream_chunk(
                 reasoning_content="Downloading character avatar...\n"
             )
@@ -1416,19 +2084,30 @@ class GenerationHandler:
             avatar_data = await self.sora_client.download_character_image(profile_asset_url)
             debug_logger.log_info(f"Avatar downloaded, size: {len(avatar_data)} bytes")
 
-            # Step 4: Upload avatar
+            # Step 5: Upload avatar
             yield self._format_stream_chunk(
                 reasoning_content="Uploading character avatar...\n"
             )
             asset_pointer = await self.sora_client.upload_character_image(avatar_data, token_obj.token)
             debug_logger.log_info(f"Avatar uploaded, asset_pointer: {asset_pointer}")
 
-            # Step 5: Finalize character
+            # Step 6: Finalize character - use custom instruction_set and safety_instruction_set if provided
             yield self._format_stream_chunk(
                 reasoning_content="Finalizing character creation...\n"
             )
-            # instruction_set_hint is a string, but instruction_set in cameo_status might be an array
-            instruction_set = cameo_status.get("instruction_set_hint") or cameo_status.get("instruction_set")
+
+            # Determine instruction_set: custom > API hint > None
+            if character_options and character_options.instruction_set:
+                instruction_set = character_options.instruction_set
+                debug_logger.log_info(f"Using custom instruction_set")
+            else:
+                instruction_set = cameo_status.get("instruction_set_hint") or cameo_status.get("instruction_set")
+
+            # Determine safety_instruction_set: custom > None
+            safety_instruction_set = None
+            if character_options and character_options.safety_instruction_set:
+                safety_instruction_set = character_options.safety_instruction_set
+                debug_logger.log_info(f"Using custom safety_instruction_set")
 
             character_id = await self.sora_client.finalize_character(
                 cameo_id=cameo_id,
@@ -1436,33 +2115,28 @@ class GenerationHandler:
                 display_name=display_name,
                 profile_asset_pointer=asset_pointer,
                 instruction_set=instruction_set,
+                safety_instruction_set=safety_instruction_set,
                 token=token_obj.token
             )
             debug_logger.log_info(f"Character finalized, character_id: {character_id}")
 
-            # Log successful character creation (before video generation)
-            character_creation_duration = time.time() - start_time
-            await self._log_request(
+            # Save character to database (even for video generation, we track the character)
+            character_record = Character(
+                cameo_id=cameo_id,
+                character_id=character_id,
                 token_id=token_obj.id,
-                operation="character_with_video",
-                request_data={
-                    "type": "character_creation_with_video",
-                    "has_video": True,
-                    "prompt": prompt
-                },
-                response_data={
-                    "success": True,
-                    "username": username,
-                    "display_name": display_name,
-                    "character_id": character_id,
-                    "cameo_id": cameo_id,
-                    "stage": "character_created"
-                },
-                status_code=200,
-                duration=character_creation_duration
+                username=username,
+                display_name=display_name,
+                profile_url=profile_asset_url,
+                instruction_set=json.dumps(instruction_set) if instruction_set else None,
+                safety_instruction_set=json.dumps(safety_instruction_set) if safety_instruction_set else None,
+                visibility="private",  # Will be deleted after video generation
+                status="finalized"
             )
+            await self.db.create_character(character_record)
+            debug_logger.log_info(f"Character saved to database: cameo_id={cameo_id}")
 
-            # Step 6: Generate video with character
+            # Step 7: Generate video with character
             yield self._format_stream_chunk(
                 reasoning_content="**Video Generation Process Begins**\n\nGenerating video with character...\n"
             )
@@ -1482,9 +2156,8 @@ class GenerationHandler:
                 full_prompt, token_obj.token,
                 orientation=model_config["orientation"],
                 n_frames=n_frames,
-                model=sora_model,
-                size=video_size,
-                token_id=token_obj.id
+                model=model_config.get("model", "sy_8"),
+                size=model_config.get("size", "small")
             )
             debug_logger.log_info(f"Video generation started, task_id: {task_id}")
 

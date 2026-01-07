@@ -208,5 +208,151 @@ class Config:
             self._config["token_refresh"] = {}
         self._config["token_refresh"]["at_auto_refresh_enabled"] = enabled
 
+    # ==================== Cloudflare Configuration ====================
+    
+    @property
+    def cf_enabled(self) -> bool:
+        """Get Cloudflare solver enabled status"""
+        cf_config = self._config.get("cloudflare", {})
+        # Support both 'enabled' and legacy 'solver_enabled'
+        return cf_config.get("enabled", cf_config.get("solver_enabled", False))
+
+    def set_cf_enabled(self, enabled: bool):
+        """Set Cloudflare solver enabled/disabled"""
+        if "cloudflare" not in self._config:
+            self._config["cloudflare"] = {}
+        self._config["cloudflare"]["enabled"] = enabled
+
+    @property
+    def cf_api_key(self) -> str:
+        """Get Cloudflare solver API key"""
+        return self._config.get("cloudflare", {}).get("api_key", "")
+
+    def set_cf_api_key(self, key: str):
+        """Set Cloudflare solver API key"""
+        if "cloudflare" not in self._config:
+            self._config["cloudflare"] = {}
+        self._config["cloudflare"]["api_key"] = key
+
+    @property
+    def cf_api_url(self) -> str:
+        """Get Cloudflare solver base URL (e.g., http://localhost:8000)"""
+        cf_config = self._config.get("cloudflare", {})
+        # Support both 'api_url' and legacy 'solver_api_url'
+        return cf_config.get("api_url", cf_config.get("solver_api_url", "http://localhost:8000"))
+
+    def set_cf_api_url(self, url: str):
+        """Set Cloudflare solver base URL"""
+        if "cloudflare" not in self._config:
+            self._config["cloudflare"] = {}
+        self._config["cloudflare"]["api_url"] = url
+
+    @property
+    def cf_global_enabled(self) -> bool:
+        """Get Cloudflare global mode enabled (use CF for all requests)"""
+        return self._config.get("cloudflare", {}).get("global_enabled", False)
+
+    def set_cf_global_enabled(self, enabled: bool):
+        """Set Cloudflare global mode enabled/disabled"""
+        if "cloudflare" not in self._config:
+            self._config["cloudflare"] = {}
+        self._config["cloudflare"]["global_enabled"] = enabled
+
+    @property
+    def cf_api_only_enabled(self) -> bool:
+        """Get Cloudflare API-only mode enabled (use CF only for API requests)"""
+        return self._config.get("cloudflare", {}).get("api_only_enabled", True)
+
+    def set_cf_api_only_enabled(self, enabled: bool):
+        """Set Cloudflare API-only mode enabled/disabled"""
+        if "cloudflare" not in self._config:
+            self._config["cloudflare"] = {}
+        self._config["cloudflare"]["api_only_enabled"] = enabled
+
+    # ==================== Database Configuration ====================
+    
+    @property
+    def db_type(self) -> str:
+        """Get database type: sqlite or mysql"""
+        return self._config.get("database", {}).get("type", "sqlite")
+
+    @property
+    def sqlite_path(self) -> str:
+        """Get SQLite database path"""
+        return self._config.get("database", {}).get("sqlite_path", "data/hancat.db")
+
+    @property
+    def mysql_host(self) -> str:
+        """Get MySQL host"""
+        return self._config.get("database", {}).get("mysql_host", "localhost")
+
+    @property
+    def mysql_port(self) -> int:
+        """Get MySQL port"""
+        return self._config.get("database", {}).get("mysql_port", 3306)
+
+    @property
+    def mysql_user(self) -> str:
+        """Get MySQL user"""
+        return self._config.get("database", {}).get("mysql_user", "root")
+
+    @property
+    def mysql_password(self) -> str:
+        """Get MySQL password"""
+        return self._config.get("database", {}).get("mysql_password", "")
+
+    @property
+    def mysql_database(self) -> str:
+        """Get MySQL database name"""
+        return self._config.get("database", {}).get("mysql_database", "sora2api")
+
+    @property
+    def mysql_pool_size(self) -> int:
+        """Get MySQL connection pool size"""
+        return self._config.get("database", {}).get("mysql_pool_size", 10)
+
+    # ==================== Redis Configuration ====================
+    
+    @property
+    def redis_enabled(self) -> bool:
+        """Get Redis enabled status"""
+        return self._config.get("redis", {}).get("enabled", False)
+
+    @property
+    def redis_host(self) -> str:
+        """Get Redis host"""
+        return self._config.get("redis", {}).get("host", "localhost")
+
+    @property
+    def redis_port(self) -> int:
+        """Get Redis port"""
+        return self._config.get("redis", {}).get("port", 6379)
+
+    @property
+    def redis_password(self) -> str:
+        """Get Redis password"""
+        return self._config.get("redis", {}).get("password", "")
+
+    @property
+    def redis_db(self) -> int:
+        """Get Redis database number"""
+        return self._config.get("redis", {}).get("db", 0)
+
+    @property
+    def redis_lock_timeout(self) -> int:
+        """Get Redis lock timeout in seconds"""
+        return self._config.get("redis", {}).get("lock_timeout", 300)
+
+    # Legacy aliases for backward compatibility
+    @property
+    def cloudflare_solver_enabled(self) -> bool:
+        """Legacy alias for cf_enabled"""
+        return self.cf_enabled
+
+    @property
+    def cloudflare_solver_api_url(self) -> str:
+        """Legacy alias for cf_api_url"""
+        return self.cf_api_url
+
 # Global config instance
 config = Config()

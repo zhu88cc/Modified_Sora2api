@@ -8,11 +8,12 @@ class Token(BaseModel):
     id: Optional[int] = None
     token: str
     email: str
+    username: Optional[str] = ""  # Username from Sora API
     name: Optional[str] = ""
     st: Optional[str] = None
     rt: Optional[str] = None
     client_id: Optional[str] = None
-    proxy_url: Optional[str] = None
+    proxy_url: Optional[str] = None  # Token-specific proxy URL
     remark: Optional[str] = None
     expiry_time: Optional[datetime] = None
     is_active: bool = True
@@ -57,15 +58,31 @@ class Task(BaseModel):
     """Task model"""
     id: Optional[int] = None
     task_id: str
-    token_id: int
+    token_id: Optional[int] = None  # Can be None for async tasks before token assignment
     model: str
     prompt: str
-    status: str = "processing"  # processing/completed/failed
+    status: str = "processing"  # processing/completed/failed/cancelled
     progress: float = 0.0
     result_urls: Optional[str] = None  # JSON array
     error_message: Optional[str] = None
     created_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+
+class Character(BaseModel):
+    """Character (角色卡) model"""
+    id: Optional[int] = None
+    cameo_id: str  # Sora cameo ID (e.g., 693afd1c8848819183981970eea64a31)
+    character_id: Optional[str] = None  # Sora character ID
+    token_id: int  # Associated token ID
+    username: str  # Character username
+    display_name: str  # Character display name
+    profile_url: Optional[str] = None  # Profile image URL
+    instruction_set: Optional[str] = None  # JSON string of instruction_set
+    safety_instruction_set: Optional[str] = None  # JSON string of safety_instruction_set
+    visibility: str = "private"  # private/public
+    status: str = "finalized"  # processing/finalized/deleted
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
 class RequestLog(BaseModel):
     """Request log model"""
@@ -94,6 +111,7 @@ class ProxyConfig(BaseModel):
     id: int = 1
     proxy_enabled: bool  # Read from database, initialized from setting.toml on first startup
     proxy_url: Optional[str] = None  # Read from database, initialized from setting.toml on first startup
+    proxy_pool_enabled: bool = False  # Enable proxy pool rotation from data/proxy.txt
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -131,10 +149,65 @@ class TokenRefreshConfig(BaseModel):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
+class CloudflareSolverConfig(BaseModel):
+    """Cloudflare Solver configuration"""
+    id: int = 1
+    solver_enabled: bool = False  # Read from database, initialized from setting.toml on first startup
+    solver_api_url: str = "http://localhost:8000/v1/challenge"  # Solver API URL
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+class WebDAVConfig(BaseModel):
+    """WebDAV configuration"""
+    id: int = 1
+    webdav_enabled: bool = False
+    webdav_url: Optional[str] = None
+    webdav_username: Optional[str] = None
+    webdav_password: Optional[str] = None
+    webdav_upload_path: str = "/video"  # Default upload path
+    auto_delete_enabled: bool = False  # Auto delete after specified days
+    auto_delete_days: int = 30  # Days to keep files
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+class VideoRecord(BaseModel):
+    """Video record for WebDAV uploaded videos"""
+    id: Optional[int] = None
+    task_id: str  # Associated task ID
+    token_id: int  # Associated token ID
+    original_url: str  # Original video URL (with watermark)
+    watermark_free_url: Optional[str] = None  # Watermark-free video URL
+    webdav_path: Optional[str] = None  # Path on WebDAV server
+    webdav_url: Optional[str] = None  # Full WebDAV access URL
+    file_size: Optional[int] = None  # File size in bytes
+    status: str = "pending"  # pending/uploading/uploaded/failed/deleted
+    error_message: Optional[str] = None
+    created_at: Optional[datetime] = None
+    uploaded_at: Optional[datetime] = None
+    deleted_at: Optional[datetime] = None
+
+class UploadLog(BaseModel):
+    """Upload log for WebDAV operations"""
+    id: Optional[int] = None
+    video_record_id: Optional[int] = None
+    operation: str  # upload/delete/list
+    status: str  # success/failed
+    message: Optional[str] = None
+    duration: Optional[float] = None  # Operation duration in seconds
+    created_at: Optional[datetime] = None
+
 # API Request/Response models
 class ChatMessage(BaseModel):
     role: str
     content: Union[str, List[dict]]  # Support both string and array format (OpenAI multimodal)
+
+class CharacterOptions(BaseModel):
+    """Character creation options"""
+    timestamps: Optional[str] = None  # e.g., "0,3" - video timestamps for character extraction
+    username: Optional[str] = None  # Custom username for character
+    display_name: Optional[str] = None  # Custom display name for character
+    instruction_set: Optional[str] = None  # Character instruction set
+    safety_instruction_set: Optional[str] = None  # Safety instruction set
 
 class ChatCompletionRequest(BaseModel):
     model: str
@@ -144,6 +217,10 @@ class ChatCompletionRequest(BaseModel):
     remix_target_id: Optional[str] = None  # Sora share link video ID for remix
     stream: bool = False
     max_tokens: Optional[int] = None
+    # Character creation options
+    character_options: Optional[CharacterOptions] = None
+    # Video style (festive, retro, news, selfie, handheld, anime)
+    style_id: Optional[str] = None
 
 class ChatCompletionChoice(BaseModel):
     index: int

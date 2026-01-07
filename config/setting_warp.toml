@@ -34,7 +34,7 @@ error_ban_threshold = 3
 
 [proxy]
 proxy_enabled = true
-proxy_url = "socks5://warp:1080"
+proxy_url = "socks5://172.17.0.3:1080"
 
 [watermark_free]
 watermark_free_enabled = false
@@ -44,3 +44,12 @@ custom_parse_token = ""
 
 [token_refresh]
 at_auto_refresh_enabled = false
+
+[webdav]
+webdav_enabled = false
+webdav_url = ""
+webdav_username = ""
+webdav_password = ""
+webdav_upload_path = "/video"
+auto_delete_enabled = false
+auto_delete_days = 30

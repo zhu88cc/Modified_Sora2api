@@ -1,0 +1,518 @@
+====================================================================================================
+🔵 [REQUEST] 2026-01-07 11:01:12.438
+----------------------------------------------------------------------------------------------------
+Method: POST
+URL: https://sora.chatgpt.com/backend/nf/create
+
+📋 Headers:
+  Accept: application/json, text/plain, */*
+  Accept-Encoding: gzip, deflate, br, zstd
+  Accept-Language: en-US,en;q=0.9
+  Cache-Control: no-cache
+  Origin: https://sora.chatgpt.com
+  Pragma: no-cache
+  Priority: u=1, i
+  Referer: https://sora.chatgpt.com/
+  Sec-Ch-Ua: "Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"
+  Sec-Ch-Ua-Mobile: ?1
+  Sec-Ch-Ua-Platform: "iOS"
+  Sec-Fetch-Dest: empty
+  Sec-Fetch-Mode: cors
+  Sec-Fetch-Site: same-origin
+  Authorization: Bearer eyJhbG...T7SYuc
+  User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1
+  oai-device-id: fa6996d4-c393-42a5-ac9c-fb4649ffa52a
+  oai-language: en-US
+  Content-Type: application/json
+  openai-sentinel-token: dgGfaTmazdalwvGJua
+
+📦 Request Body:
+{
+  "kind": "video",
+  "prompt": "一只小猫在草地上奔跑",
+  "orientation": "landscape",
+  "size": "small",
+  "n_frames": 300,
+  "model": "sy_8",
+  "inpaint_items": []
+}
+
+🌐 Proxy: http://127.0.0.1:7897
+====================================================================================================
+
+====================================================================================================
+🟢 [RESPONSE] 2026-01-07 11:01:13.229
+----------------------------------------------------------------------------------------------------
+Status: 400 ❌
+Duration: 789.69ms
+
+📋 Response Headers:
+  date: Wed, 07 Jan 2026 03:01:15 GMT
+  content-type: application/json
+  content-length: 180
+  openai-version: 2020-10-01
+  openai-organization: user-anqu4qsqhqxbrbivf3gjm2if
+  x-request-id: c2399ccb-7766-4b80-9154-3333bc7781ee
+  openai-processing-ms: 544
+  access-control-allow-origin: https://sora.chatgpt.com
+  vary: Origin
+  x-envoy-upstream-service-time: 549
+  x-openai-proxy-wasm: v0.1
+  cf-cache-status: DYNAMIC
+  strict-transport-security: max-age=31536000; includeSubDomains; preload
+  x-content-type-options: nosniff
+  server: cloudflare
+  cf-ray: 9ba035a049e0d2fd-NRT
+
+📦 Response Body:
+{
+  "error": {
+    "message": "You must verify a phone number before continuing.",
+    "type": "phone_number_required",
+    "param": null,
+    "code": "phone_number_required"
+  }
+}
+====================================================================================================
+
+====================================================================================================
+🔴 [ERROR] 2026-01-07 11:01:13.230
+----------------------------------------------------------------------------------------------------
+Status Code: 400
+Error Message: You must verify a phone number before continuing.
+
+📦 Error Response:
+{
+  "error": {
+    "message": "You must verify a phone number before continuing.",
+    "type": "phone_number_required",
+    "param": null,
+    "code": "phone_number_required"
+  }
+}
+====================================================================================================
+
+ℹ️  [2026-01-07 11:02:18.633] Token 2 concurrency reset (image: -1, video: -1)
+====================================================================================================
+🔵 [REQUEST] 2026-01-07 11:02:31.169
+----------------------------------------------------------------------------------------------------
+Method: POST
+URL: https://sora.chatgpt.com/backend/nf/create
+
+📋 Headers:
+  Accept: application/json, text/plain, */*
+  Accept-Encoding: gzip, deflate, br, zstd
+  Accept-Language: en-US,en;q=0.9
+  Cache-Control: no-cache
+  Origin: https://sora.chatgpt.com
+  Pragma: no-cache
+  Priority: u=1, i
+  Referer: https://sora.chatgpt.com/
+  Sec-Ch-Ua: "Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"
+  Sec-Ch-Ua-Mobile: ?1
+  Sec-Ch-Ua-Platform: "iOS"
+  Sec-Fetch-Dest: empty
+  Sec-Fetch-Mode: cors
+  Sec-Fetch-Site: same-origin
+  Authorization: Bearer eyJhbG...evhKC4
+  User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1
+  oai-device-id: a2355eca-6330-4dd9-81ff-14bb8ac64e21
+  oai-language: en-US
+  Content-Type: application/json
+  openai-sentinel-token: zv3xorLjEBo2DbB
+
+📦 Request Body:
+{
+  "kind": "video",
+  "prompt": "一只小猫在草地上奔跑",
+  "orientation": "landscape",
+  "size": "small",
+  "n_frames": 300,
+  "model": "sy_8",
+  "inpaint_items": []
+}
+
+🌐 Proxy: http://127.0.0.1:7897
+====================================================================================================
+
+====================================================================================================
+🟢 [RESPONSE] 2026-01-07 11:02:33.285
+----------------------------------------------------------------------------------------------------
+Status: 200 ✅
+Duration: 2113.41ms
+
+📋 Response Headers:
+  date: Wed, 07 Jan 2026 03:02:35 GMT
+  content-type: application/json
+  openai-version: 2020-10-01
+  openai-organization: user-1wo4snsdfrno8lpml3k1kiok
+  x-request-id: 8c7bfe9f-5791-47d8-9144-8f1f5efbca7b
+  openai-processing-ms: 1640
+  access-control-allow-origin: https://sora.chatgpt.com
+  vary: Origin
+  x-envoy-upstream-service-time: 1646
+  x-openai-proxy-wasm: v0.1
+  cf-cache-status: DYNAMIC
+  set-cookie: __cf_bm=CKL_TBkPzZiR.3ryT.2gUgKZku1uIsvH0pu66BxjoPg-1767754955-1.0.1.1-CVyYmWM7uL_RU53O0j54.5UlddbMsC2hV71glfbLDBrXVRqHcHCmBW5SoshW7iE6f8tVJCd8ZkJdFGUe0q.UkqtUbnesyE3J079KDKelaKA; path=/; expires=Wed, 07-Jan-26 03:32:35 GMT; domain=.sora.chatgpt.com; HttpOnly; Secure; SameSite=None, __cflb=0H28vBjUqcdJN5F5i8DLknvCQqDro4yRaiDhd3YH3vM; SameSite=None; Secure; path=/; expires=Wed, 07-Jan-26 03:32:35 GMT; HttpOnly, _cfuvid=Ro_HFhiSHgDVV6WLHIj0VGSh0DW6wWF0SNagLOIe7J0-1767754955669-0.0.1.1-604800000; path=/; domain=.sora.chatgpt.com; HttpOnly; Secure; SameSite=None
+  strict-transport-security: max-age=31536000; includeSubDomains; preload
+  x-content-type-options: nosniff
+  server: cloudflare
+  cf-ray: 9ba0378dc8008a79-NRT
+  content-encoding: gzip
+
+📦 Response Body:
+{
+  "id": "task_01keb6fxtpedq87yhtas8b1c8f",
+  "priority": 1,
+  "rate_limit_and_credit_balance": {
+    "rate_limit_reached": false,
+    "access_resets_in_seconds": 85662,
+    "credit_remaining": 0,
+    "estimated_num_videos_remaining": 30,
+    "estimated_num_purchased_videos_remaining": 0
+  }
+}
+====================================================================================================
+
+ℹ️  [2026-01-07 11:02:34.487] Starting task polling: task_id=task_01keb6fxtpedq87yhtas8b1c8f, is_video=True, timeout=1500s, adaptive_polling=enabled
+ℹ️  [2026-01-07 11:02:34.718] Watermark-free mode: DISABLED
+====================================================================================================
+🔵 [REQUEST] 2026-01-07 11:02:39.898
+----------------------------------------------------------------------------------------------------
+Method: GET
+URL: https://sora.chatgpt.com/backend/nf/pending/v2
+
+📋 Headers:
+  Accept: application/json, text/plain, */*
+  Accept-Encoding: gzip, deflate, br, zstd
+  Accept-Language: en-US,en;q=0.9
+  Cache-Control: no-cache
+  Origin: https://sora.chatgpt.com
+  Pragma: no-cache
+  Priority: u=1, i
+  Referer: https://sora.chatgpt.com/
+  Sec-Ch-Ua: "Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"
+  Sec-Ch-Ua-Mobile: ?1
+  Sec-Ch-Ua-Platform: "iOS"
+  Sec-Fetch-Dest: empty
+  Sec-Fetch-Mode: cors
+  Sec-Fetch-Site: same-origin
+  Authorization: Bearer eyJhbG...evhKC4
+  User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1
+  oai-device-id: 8b414fd6-fde7-4dae-8054-3ca21807cde8
+  oai-language: en-US
+  Content-Type: application/json
+
+🌐 Proxy: http://127.0.0.1:7897
+====================================================================================================
+
+====================================================================================================
+🟢 [RESPONSE] 2026-01-07 11:02:40.520
+----------------------------------------------------------------------------------------------------
+Status: 200 ✅
+Duration: 620.56ms
+
+📋 Response Headers:
+  date: Wed, 07 Jan 2026 03:02:42 GMT
+  content-type: application/json
+  openai-version: 2020-10-01
+  openai-organization: user-1wo4snsdfrno8lpml3k1kiok
+  x-request-id: 350cafeb-bc43-4ff0-b7dd-74431ee0a171
+  openai-processing-ms: 355
+  access-control-allow-origin: https://sora.chatgpt.com
+  vary: Origin
+  x-envoy-upstream-service-time: 375
+  x-openai-proxy-wasm: v0.1
+  cf-cache-status: DYNAMIC
+  strict-transport-security: max-age=31536000; includeSubDomains; preload
+  x-content-type-options: nosniff
+  server: cloudflare
+  cf-ray: 9ba037c2e9418a79-NRT
+  content-encoding: gzip
+
+📦 Response Body:
+[
+  {
+    "id": "task_01keb6fxtpedq87yhtas8b1c8f",
+    "status": "queued",
+    "prompt": "一只小猫在草地上奔跑",
+    "title": null,
+    "progress_pct": null,
+    "generations": []
+  }
+]
+====================================================================================================
+
+====================================================================================================
+🔵 [REQUEST] 2026-01-07 11:02:45.636
+----------------------------------------------------------------------------------------------------
+Method: GET
+URL: https://sora.chatgpt.com/backend/nf/pending/v2
+
+📋 Headers:
+  Accept: application/json, text/plain, */*
+  Accept-Encoding: gzip, deflate, br, zstd
+  Accept-Language: en-US,en;q=0.9
+  Cache-Control: no-cache
+  Origin: https://sora.chatgpt.com
+  Pragma: no-cache
+  Priority: u=1, i
+  Referer: https://sora.chatgpt.com/
+  Sec-Ch-Ua: "Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"
+  Sec-Ch-Ua-Mobile: ?1
+  Sec-Ch-Ua-Platform: "iOS"
+  Sec-Fetch-Dest: empty
+  Sec-Fetch-Mode: cors
+  Sec-Fetch-Site: same-origin
+  Authorization: Bearer eyJhbG...evhKC4
+  User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1
+  oai-device-id: d8871410-2c39-4332-8d3a-1e0d0f13f3b0
+  oai-language: en-US
+  Content-Type: application/json
+
+🌐 Proxy: http://127.0.0.1:7897
+====================================================================================================
+
+====================================================================================================
+🟢 [RESPONSE] 2026-01-07 11:02:46.157
+----------------------------------------------------------------------------------------------------
+Status: 200 ✅
+Duration: 520.20ms
+
+📋 Response Headers:
+  date: Wed, 07 Jan 2026 03:02:48 GMT
+  content-type: application/json
+  openai-version: 2020-10-01
+  openai-organization: user-1wo4snsdfrno8lpml3k1kiok
+  x-request-id: 04103435-e7eb-4ca7-a284-b7db21a45c0d
+  openai-processing-ms: 279
+  access-control-allow-origin: https://sora.chatgpt.com
+  vary: Origin
+  x-envoy-upstream-service-time: 284
+  x-openai-proxy-wasm: v0.1
+  cf-cache-status: DYNAMIC
+  strict-transport-security: max-age=31536000; includeSubDomains; preload
+  x-content-type-options: nosniff
+  server: cloudflare
+  cf-ray: 9ba037e6c9178a79-NRT
+  content-encoding: gzip
+
+📦 Response Body:
+[
+  {
+    "id": "task_01keb6fxtpedq87yhtas8b1c8f",
+    "status": "queued",
+    "prompt": "一只小猫在草地上奔跑",
+    "title": null,
+    "progress_pct": null,
+    "generations": []
+  }
+]
+====================================================================================================
+
+====================================================================================================
+🔵 [REQUEST] 2026-01-07 11:02:51.387
+----------------------------------------------------------------------------------------------------
+Method: GET
+URL: https://sora.chatgpt.com/backend/nf/pending/v2
+
+📋 Headers:
+  Accept: application/json, text/plain, */*
+  Accept-Encoding: gzip, deflate, br, zstd
+  Accept-Language: en-US,en;q=0.9
+  Cache-Control: no-cache
+  Origin: https://sora.chatgpt.com
+  Pragma: no-cache
+  Priority: u=1, i
+  Referer: https://sora.chatgpt.com/
+  Sec-Ch-Ua: "Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"
+  Sec-Ch-Ua-Mobile: ?1
+  Sec-Ch-Ua-Platform: "iOS"
+  Sec-Fetch-Dest: empty
+  Sec-Fetch-Mode: cors
+  Sec-Fetch-Site: same-origin
+  Authorization: Bearer eyJhbG...evhKC4
+  User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1
+  oai-device-id: a684c7bd-6460-468d-8fbb-62cd71ad52f6
+  oai-language: en-US
+  Content-Type: application/json
+
+🌐 Proxy: http://127.0.0.1:7897
+====================================================================================================
+
+====================================================================================================
+🟢 [RESPONSE] 2026-01-07 11:02:51.881
+----------------------------------------------------------------------------------------------------
+Status: 200 ✅
+Duration: 492.42ms
+
+📋 Response Headers:
+  date: Wed, 07 Jan 2026 03:02:54 GMT
+  content-type: application/json
+  openai-version: 2020-10-01
+  openai-organization: user-1wo4snsdfrno8lpml3k1kiok
+  x-request-id: e1632f97-2ece-4c31-a794-cecd21870ac5
+  openai-processing-ms: 265
+  access-control-allow-origin: https://sora.chatgpt.com
+  vary: Origin
+  x-envoy-upstream-service-time: 270
+  x-openai-proxy-wasm: v0.1
+  cf-cache-status: DYNAMIC
+  strict-transport-security: max-age=31536000; includeSubDomains; preload
+  x-content-type-options: nosniff
+  server: cloudflare
+  cf-ray: 9ba0380aa83e8a79-NRT
+  content-encoding: gzip
+
+📦 Response Body:
+[
+  {
+    "id": "task_01keb6fxtpedq87yhtas8b1c8f",
+    "status": "queued",
+    "prompt": "一只小猫在草地上奔跑",
+    "title": null,
+    "progress_pct": null,
+    "generations": []
+  }
+]
+====================================================================================================
+
+ℹ️  [2026-01-07 11:02:51.881] Task task_01keb6fxtpedq87yhtas8b1c8f stall detected, using extended interval: 7.5s
+====================================================================================================
+🔵 [REQUEST] 2026-01-07 11:02:59.469
+----------------------------------------------------------------------------------------------------
+Method: GET
+URL: https://sora.chatgpt.com/backend/nf/pending/v2
+
+📋 Headers:
+  Accept: application/json, text/plain, */*
+  Accept-Encoding: gzip, deflate, br, zstd
+  Accept-Language: en-US,en;q=0.9
+  Cache-Control: no-cache
+  Origin: https://sora.chatgpt.com
+  Pragma: no-cache
+  Priority: u=1, i
+  Referer: https://sora.chatgpt.com/
+  Sec-Ch-Ua: "Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"
+  Sec-Ch-Ua-Mobile: ?1
+  Sec-Ch-Ua-Platform: "iOS"
+  Sec-Fetch-Dest: empty
+  Sec-Fetch-Mode: cors
+  Sec-Fetch-Site: same-origin
+  Authorization: Bearer eyJhbG...evhKC4
+  User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1
+  oai-device-id: db54c79a-328a-4b59-abfb-f536e4b84686
+  oai-language: en-US
+  Content-Type: application/json
+
+🌐 Proxy: http://127.0.0.1:7897
+====================================================================================================
+
+====================================================================================================
+🟢 [RESPONSE] 2026-01-07 11:03:00.135
+----------------------------------------------------------------------------------------------------
+Status: 200 ✅
+Duration: 664.37ms
+
+📋 Response Headers:
+  date: Wed, 07 Jan 2026 03:03:02 GMT
+  content-type: application/json
+  openai-version: 2020-10-01
+  openai-organization: user-1wo4snsdfrno8lpml3k1kiok
+  x-request-id: 41e00182-a97e-40c9-a56e-310ad36c91eb
+  openai-processing-ms: 398
+  access-control-allow-origin: https://sora.chatgpt.com
+  vary: Origin
+  x-envoy-upstream-service-time: 445
+  x-openai-proxy-wasm: v0.1
+  cf-cache-status: DYNAMIC
+  strict-transport-security: max-age=31536000; includeSubDomains; preload
+  x-content-type-options: nosniff
+  server: cloudflare
+  cf-ray: 9ba0383d3af48a79-NRT
+  content-encoding: gzip
+
+📦 Response Body:
+[
+  {
+    "id": "task_01keb6fxtpedq87yhtas8b1c8f",
+    "status": "queued",
+    "prompt": "一只小猫在草地上奔跑",
+    "title": null,
+    "progress_pct": null,
+    "generations": []
+  }
+]
+====================================================================================================
+
+ℹ️  [2026-01-07 11:03:00.136] Task task_01keb6fxtpedq87yhtas8b1c8f stall detected, using extended interval: 7.5s
+====================================================================================================
+🔵 [REQUEST] 2026-01-07 11:03:07.848
+----------------------------------------------------------------------------------------------------
+Method: GET
+URL: https://sora.chatgpt.com/backend/nf/pending/v2
+
+📋 Headers:
+  Accept: application/json, text/plain, */*
+  Accept-Encoding: gzip, deflate, br, zstd
+  Accept-Language: en-US,en;q=0.9
+  Cache-Control: no-cache
+  Origin: https://sora.chatgpt.com
+  Pragma: no-cache
+  Priority: u=1, i
+  Referer: https://sora.chatgpt.com/
+  Sec-Ch-Ua: "Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"
+  Sec-Ch-Ua-Mobile: ?1
+  Sec-Ch-Ua-Platform: "iOS"
+  Sec-Fetch-Dest: empty
+  Sec-Fetch-Mode: cors
+  Sec-Fetch-Site: same-origin
+  Authorization: Bearer eyJhbG...evhKC4
+  User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1
+  oai-device-id: 608386f6-5ead-47c8-acdf-f35c5d8e45e3
+  oai-language: en-US
+  Content-Type: application/json
+
+🌐 Proxy: http://127.0.0.1:7897
+====================================================================================================
+
+====================================================================================================
+🟢 [RESPONSE] 2026-01-07 11:03:08.316
+----------------------------------------------------------------------------------------------------
+Status: 200 ✅
+Duration: 465.81ms
+
+📋 Response Headers:
+  date: Wed, 07 Jan 2026 03:03:10 GMT
+  content-type: application/json
+  openai-version: 2020-10-01
+  openai-organization: user-1wo4snsdfrno8lpml3k1kiok
+  x-request-id: 9fc92e98-d0dc-409c-b11d-8de7b296ad7d
+  openai-processing-ms: 240
+  access-control-allow-origin: https://sora.chatgpt.com
+  vary: Origin
+  x-envoy-upstream-service-time: 244
+  x-openai-proxy-wasm: v0.1
+  cf-cache-status: DYNAMIC
+  strict-transport-security: max-age=31536000; includeSubDomains; preload
+  x-content-type-options: nosniff
+  server: cloudflare
+  cf-ray: 9ba038719b8e8a79-NRT
+  content-encoding: gzip
+
+📦 Response Body:
+[
+  {
+    "id": "task_01keb6fxtpedq87yhtas8b1c8f",
+    "status": "queued",
+    "prompt": "一只小猫在草地上奔跑",
+    "title": null,
+    "progress_pct": null,
+    "generations": []
+  }
+]
+====================================================================================================
+
+ℹ️  [2026-01-07 11:03:08.317] Task task_01keb6fxtpedq87yhtas8b1c8f progress: 0% (status: queued, next_interval=7.5s)
+ℹ️  [2026-01-07 11:03:08.318] Task task_01keb6fxtpedq87yhtas8b1c8f stall detected, using extended interval: 7.5s
+ℹ️  [2026-01-07 11:03:12.565] Request cancelled, task task_01keb6fxtpedq87yhtas8b1c8f status: processing

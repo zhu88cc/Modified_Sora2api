@@ -1,0 +1,17 @@
+# 代理池配置文件
+# 每行一个代理地址，支持以下格式：
+#
+# HTTP:        http://user:pass@host:port
+# HTTPS:       https://user:pass@host:port
+# SOCKS5:      socks5://user:pass@host:port
+# SOCKS5H:     socks5h://user:pass@host:port
+# SOCKS5简化:  socks5://host:port:user:pass
+# ST5简写:     st5 host:port:user:pass
+# HTTP简化:    host:port:user:pass
+# 无认证:      host:port
+#
+# 💡 示例:
+# st5 38.134.216.107:13611:user:pass
+# socks5://user:pass@dc.example.com:10001
+# socks5://38.134.216.107:13611:user:pass
+# http://user:pass@proxy.example.com:8080

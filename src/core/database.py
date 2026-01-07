@@ -1,42 +1,276 @@
-"""Database storage layer"""
+﻿"""Database storage layer"""
 import aiosqlite
+import asyncio
 import json
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict
 from pathlib import Path
-from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, WatermarkFreeConfig, CacheConfig, GenerationConfig, TokenRefreshConfig
+from contextlib import asynccontextmanager
+from .models import Token, TokenStats, Task, RequestLog, AdminConfig, ProxyConfig, WatermarkFreeConfig, CacheConfig, GenerationConfig, TokenRefreshConfig, CloudflareSolverConfig, Character, WebDAVConfig, VideoRecord, UploadLog
+from .db_pool import get_db_connection
+from .config import config
+
+
+import warnings
+
+class _MySQLConnectionWrapper:
+    """Wrapper to make MySQL cursor behave like SQLite connection"""
+
+    def __init__(self, conn, cursor, pool=None):
+        self._conn = conn
+        self._cursor = cursor
+        self._pool = pool
+        self.row_factory = None
+
+    async def execute(self, sql: str, params: tuple = None):
+        # Convert SQLite placeholders to MySQL
+        sql = sql.replace("?", "%s")
+        # Handle SQLite-specific syntax
+        sql = sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "INT AUTO_INCREMENT PRIMARY KEY")
+        sql = sql.replace("AUTOINCREMENT", "AUTO_INCREMENT")
+        sql = sql.replace("INSERT OR IGNORE", "INSERT IGNORE")
+        # MySQL doesn't support DEFAULT on PRIMARY KEY, convert to just PRIMARY KEY
+        sql = sql.replace("INTEGER PRIMARY KEY DEFAULT 1", "INT PRIMARY KEY")
+        sql = sql.replace("INTEGER PRIMARY KEY DEFAULT", "INT PRIMARY KEY")
+        # Convert BOOLEAN to TINYINT(1) for MySQL compatibility
+        sql = sql.replace("BOOLEAN DEFAULT 0", "TINYINT(1) DEFAULT 0")
+        sql = sql.replace("BOOLEAN DEFAULT 1", "TINYINT(1) DEFAULT 1")
+        sql = sql.replace("BOOLEAN", "TINYINT(1)")
+        # MySQL TEXT type cannot have default value, convert to VARCHAR(255)
+        import re
+        sql = re.sub(r"TEXT DEFAULT '([^']*)'", r"VARCHAR(255) DEFAULT '\1'", sql)
+
+        # Suppress MySQL warnings for CREATE TABLE IF NOT EXISTS, etc.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            if params:
+                await self._cursor.execute(sql, params)
+            else:
+                await self._cursor.execute(sql)
+        return self._cursor
+
+    async def executemany(self, sql: str, params_list: list):
+        sql = sql.replace("?", "%s")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            await self._cursor.executemany(sql, params_list)
+
+    async def commit(self):
+        await self._conn.commit()
+
+    async def close(self):
+        await self._cursor.close()
+        if self._pool:
+            self._pool.release(self._conn)
+        else:
+            self._conn.close()
+
+    async def fetchone(self):
+        return await self._cursor.fetchone()
+
+    async def fetchall(self):
+        return await self._cursor.fetchall()
+
+    @property
+    def lastrowid(self):
+        return self._cursor.lastrowid
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
 
 class Database:
-    """SQLite database manager"""
+    """Database manager with support for SQLite and MySQL"""
 
     def __init__(self, db_path: str = None):
-        if db_path is None:
-            # Store database in data directory
-            data_dir = Path(__file__).parent.parent.parent / "data"
-            data_dir.mkdir(exist_ok=True)
-            db_path = str(data_dir / "hancat.db")
-        self.db_path = db_path
+        # Determine database type from config
+        self.db_type = config.db_type.lower()
+
+        if self.db_type == "mysql":
+            self.db_path = None
+            self._mysql_pool = None
+        else:
+            # SQLite
+            if db_path is None:
+                data_dir = Path(__file__).parent.parent.parent / "data"
+                data_dir.mkdir(exist_ok=True)
+                # Use config path or default
+                sqlite_path = config.sqlite_path if config.sqlite_path else "hancat.db"
+                # If path is relative, make it relative to project root
+                if not Path(sqlite_path).is_absolute():
+                    db_path = str(Path(__file__).parent.parent.parent / sqlite_path)
+                else:
+                    db_path = sqlite_path
+            self.db_path = db_path
+
+        self._write_lock = asyncio.Lock()  # 写操作锁
+
+    def _get_count_value(self, row) -> int:
+        """Get count value from row, handling both MySQL (dict) and SQLite (tuple)"""
+        if row is None:
+            return 0
+        if isinstance(row, dict):
+            # MySQL returns dict, get first value
+            return list(row.values())[0]
+        else:
+            # SQLite returns tuple
+            return row[0]
+
+    def _get_row_value(self, row, key_or_index, default=None):
+        """Get value from row, handling both MySQL (dict) and SQLite (tuple/Row)
+
+        Args:
+            row: Database row (dict for MySQL, tuple/Row for SQLite)
+            key_or_index: Column name (str) or index (int)
+            default: Default value if not found
+        """
+        if row is None:
+            return default
+        if isinstance(row, dict):
+            # MySQL returns dict
+            if isinstance(key_or_index, str):
+                return row.get(key_or_index, default)
+            else:
+                # If index provided, get by position
+                values = list(row.values())
+                return values[key_or_index] if key_or_index < len(values) else default
+        else:
+            # SQLite returns tuple or Row
+            if isinstance(key_or_index, int):
+                return row[key_or_index] if key_or_index < len(row) else default
+            else:
+                # Try to access by name (works for aiosqlite.Row)
+                try:
+                    return row[key_or_index]
+                except (KeyError, TypeError):
+                    return default
 
     def db_exists(self) -> bool:
-        """Check if database file exists"""
+        """Check if database file exists (SQLite only)"""
+        if self.db_type == "mysql":
+            return True  # MySQL database should be created externally
         return Path(self.db_path).exists()
+
+    async def _get_mysql_pool(self):
+        """Get or create MySQL connection pool"""
+        if self._mysql_pool is None:
+            import aiomysql
+            self._mysql_pool = await aiomysql.create_pool(
+                host=config.mysql_host,
+                port=config.mysql_port,
+                user=config.mysql_user,
+                password=config.mysql_password,
+                db=config.mysql_database,
+                minsize=5,
+                maxsize=config.mysql_pool_size,
+                autocommit=False,
+                charset='utf8mb4',
+                cursorclass=aiomysql.DictCursor,
+                connect_timeout=60
+            )
+            print(f"✅ MySQL pool initialized (host: {config.mysql_host}, pool_size: {config.mysql_pool_size})")
+        return self._mysql_pool
+
+    @asynccontextmanager
+    async def _connect(self, readonly: bool = False):
+        """Get a database connection with proper settings (context manager)"""
+        if self.db_type == "mysql":
+            import aiomysql
+            pool = await self._get_mysql_pool()
+            async with pool.acquire() as conn:
+                async with conn.cursor(aiomysql.DictCursor) as cursor:
+                    yield _MySQLConnectionWrapper(conn, cursor)
+        else:
+            # SQLite with high concurrency optimizations
+            conn = await aiosqlite.connect(self.db_path, timeout=60.0)
+            try:
+                await conn.execute("PRAGMA journal_mode=WAL")
+                await conn.execute("PRAGMA synchronous=NORMAL")
+                await conn.execute("PRAGMA busy_timeout=60000")
+                await conn.execute("PRAGMA cache_size=-64000")
+                await conn.execute("PRAGMA mmap_size=268435456")
+                await conn.execute("PRAGMA temp_store=MEMORY")
+                if readonly:
+                    await conn.execute("PRAGMA query_only=ON")
+                conn.row_factory = aiosqlite.Row
+                yield conn
+            finally:
+                await conn.close()
+
+    async def _get_connection(self, readonly: bool = False):
+        """Get a database connection with proper settings (non-context manager)"""
+        if self.db_type == "mysql":
+            import aiomysql
+            pool = await self._get_mysql_pool()
+            conn = await pool.acquire()
+            return _MySQLConnectionWrapper(conn, await conn.cursor(aiomysql.DictCursor), pool=pool)
+        else:
+            conn = await aiosqlite.connect(self.db_path, timeout=60.0)
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA synchronous=NORMAL")
+            await conn.execute("PRAGMA busy_timeout=60000")
+            await conn.execute("PRAGMA cache_size=-64000")
+            await conn.execute("PRAGMA mmap_size=268435456")
+            await conn.execute("PRAGMA temp_store=MEMORY")
+            if readonly:
+                await conn.execute("PRAGMA query_only=ON")
+            conn.row_factory = aiosqlite.Row
+            return conn
+
+    async def _execute_with_retry(self, operation, max_retries: int = 5):
+        """Execute database operation with retry logic for locked database
+
+        Args:
+            operation: Async function that takes a connection and performs DB operations
+            max_retries: Maximum retry attempts (default 5 for high concurrency)
+        """
+        for attempt in range(max_retries):
+            try:
+                async with self._write_lock:
+                    async with self._connect() as conn:
+                        result = await operation(conn)
+                        await conn.commit()
+                        return result
+            except aiosqlite.OperationalError as e:
+                error_msg = str(e).lower()
+                if ("database is locked" in error_msg or "unable to open" in error_msg) and attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 0.2 + (attempt * 0.1)  # 递增等待
+                    print(f"⚠️ Database error: {e}, retrying in {wait_time:.1f}s... (attempt {attempt + 1}/{max_retries})")
+                    await asyncio.sleep(wait_time)
+                else:
+                    raise
 
     async def _table_exists(self, db, table_name: str) -> bool:
         """Check if a table exists in the database"""
-        cursor = await db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-            (table_name,)
-        )
+        if self.db_type == "mysql":
+            cursor = await db.execute(
+                "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+                (config.mysql_database, table_name)
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,)
+            )
         result = await cursor.fetchone()
         return result is not None
 
     async def _column_exists(self, db, table_name: str, column_name: str) -> bool:
         """Check if a column exists in a table"""
         try:
-            cursor = await db.execute(f"PRAGMA table_info({table_name})")
-            columns = await cursor.fetchall()
-            return any(col[1] == column_name for col in columns)
-        except:
+            if self.db_type == "mysql":
+                cursor = await db.execute(
+                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+                    (config.mysql_database, table_name, column_name)
+                )
+                result = await cursor.fetchone()
+                return result is not None
+            else:
+                cursor = await db.execute(f"PRAGMA table_info({table_name})")
+                columns = await cursor.fetchall()
+                return any(col[1] == column_name for col in columns)
+        except Exception:
             return False
 
     async def _ensure_config_rows(self, db, config_dict: dict = None):
@@ -49,7 +283,7 @@ class Database:
         # Ensure admin_config has a row
         cursor = await db.execute("SELECT COUNT(*) FROM admin_config")
         count = await cursor.fetchone()
-        if count[0] == 0:
+        if self._get_count_value(count) == 0:
             # Get admin credentials from config_dict if provided, otherwise use defaults
             admin_username = "admin"
             admin_password = "admin"
@@ -73,27 +307,29 @@ class Database:
         # Ensure proxy_config has a row
         cursor = await db.execute("SELECT COUNT(*) FROM proxy_config")
         count = await cursor.fetchone()
-        if count[0] == 0:
+        if self._get_count_value(count) == 0:
             # Get proxy config from config_dict if provided, otherwise use defaults
             proxy_enabled = False
             proxy_url = None
+            proxy_pool_enabled = False
 
             if config_dict:
                 proxy_config = config_dict.get("proxy", {})
                 proxy_enabled = proxy_config.get("proxy_enabled", False)
                 proxy_url = proxy_config.get("proxy_url", "")
+                proxy_pool_enabled = proxy_config.get("proxy_pool_enabled", False)
                 # Convert empty string to None
                 proxy_url = proxy_url if proxy_url else None
 
             await db.execute("""
-                INSERT INTO proxy_config (id, proxy_enabled, proxy_url)
-                VALUES (1, ?, ?)
-            """, (proxy_enabled, proxy_url))
+                INSERT INTO proxy_config (id, proxy_enabled, proxy_url, proxy_pool_enabled)
+                VALUES (1, ?, ?, ?)
+            """, (proxy_enabled, proxy_url, proxy_pool_enabled))
 
         # Ensure watermark_free_config has a row
         cursor = await db.execute("SELECT COUNT(*) FROM watermark_free_config")
         count = await cursor.fetchone()
-        if count[0] == 0:
+        if self._get_count_value(count) == 0:
             # Get watermark-free config from config_dict if provided, otherwise use defaults
             watermark_free_enabled = False
             parse_method = "third_party"
@@ -119,7 +355,7 @@ class Database:
         # Ensure cache_config has a row
         cursor = await db.execute("SELECT COUNT(*) FROM cache_config")
         count = await cursor.fetchone()
-        if count[0] == 0:
+        if self._get_count_value(count) == 0:
             # Get cache config from config_dict if provided, otherwise use defaults
             cache_enabled = False
             cache_timeout = 600
@@ -141,7 +377,7 @@ class Database:
         # Ensure generation_config has a row
         cursor = await db.execute("SELECT COUNT(*) FROM generation_config")
         count = await cursor.fetchone()
-        if count[0] == 0:
+        if self._get_count_value(count) == 0:
             # Get generation config from config_dict if provided, otherwise use defaults
             image_timeout = 300
             video_timeout = 3000
@@ -159,7 +395,7 @@ class Database:
         # Ensure token_refresh_config has a row
         cursor = await db.execute("SELECT COUNT(*) FROM token_refresh_config")
         count = await cursor.fetchone()
-        if count[0] == 0:
+        if self._get_count_value(count) == 0:
             # Get token refresh config from config_dict if provided, otherwise use defaults
             at_auto_refresh_enabled = False
 
@@ -172,13 +408,40 @@ class Database:
                 VALUES (1, ?)
             """, (at_auto_refresh_enabled,))
 
+        # Ensure cloudflare_solver_config has a row
+        if await self._table_exists(db, "cloudflare_solver_config"):
+            cursor = await db.execute("SELECT COUNT(*) FROM cloudflare_solver_config")
+            count = await cursor.fetchone()
+            if self._get_count_value(count) == 0:
+                # Get cloudflare solver config from config_dict if provided, otherwise use defaults
+                solver_enabled = False
+                solver_api_url = "http://localhost:8000/v1/challenge"
+
+                if config_dict:
+                    cloudflare_config = config_dict.get("cloudflare", {})
+                    solver_enabled = cloudflare_config.get("solver_enabled", cloudflare_config.get("enabled", False))
+                    solver_api_url = cloudflare_config.get("solver_api_url", cloudflare_config.get("api_url", "http://localhost:8000/v1/challenge"))
+
+                await db.execute("""
+                    INSERT INTO cloudflare_solver_config (id, solver_enabled, solver_api_url)
+                    VALUES (1, ?, ?)
+                """, (solver_enabled, solver_api_url))
+
+        # Ensure webdav_config has a row
+        if await self._table_exists(db, "webdav_config"):
+            cursor = await db.execute("SELECT COUNT(*) FROM webdav_config")
+            count = await cursor.fetchone()
+            if self._get_count_value(count) == 0:
+                await db.execute("""
+                    INSERT INTO webdav_config (id, webdav_enabled, webdav_upload_path, auto_delete_enabled, auto_delete_days)
+                    VALUES (1, 0, '/video', 0, 30)
+                """)
+
 
     async def check_and_migrate_db(self, config_dict: dict = None):
         """Check database integrity and perform migrations if needed
 
-        Args:
-            config_dict: Configuration dictionary from setting.toml (optional)
-                        Used to initialize new tables with values from setting.toml
+        使用版本号机制，只在版本变化时执行完整迁移检查
         """
         async with aiosqlite.connect(self.db_path) as db:
             print("Checking database integrity and performing migrations...")
@@ -278,7 +541,8 @@ class Database:
 
     async def init_db(self):
         """Initialize database tables - creates all tables and ensures data integrity"""
-        async with aiosqlite.connect(self.db_path) as db:
+        db = await self._get_connection()
+        try:
             # Tokens table
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS tokens (
@@ -337,7 +601,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS tasks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     task_id TEXT UNIQUE NOT NULL,
-                    token_id INTEGER NOT NULL,
+                    token_id INTEGER,
                     model TEXT NOT NULL,
                     prompt TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'processing',
@@ -345,8 +609,7 @@ class Database:
                     result_urls TEXT,
                     error_message TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    completed_at TIMESTAMP,
-                    FOREIGN KEY (token_id) REFERENCES tokens(id)
+                    completed_at TIMESTAMP
                 )
             """)
 
@@ -385,6 +648,7 @@ class Database:
                     id INTEGER PRIMARY KEY DEFAULT 1,
                     proxy_enabled BOOLEAN DEFAULT 0,
                     proxy_url TEXT,
+                    proxy_pool_enabled BOOLEAN DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -436,10 +700,96 @@ class Database:
                 )
             """)
 
+            # Cloudflare Solver config table
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS cloudflare_solver_config (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    solver_enabled BOOLEAN DEFAULT 0,
+                    solver_api_url TEXT DEFAULT 'http://localhost:8000/v1/challenge',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Characters table (角色�?
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS characters (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cameo_id TEXT UNIQUE NOT NULL,
+                    character_id TEXT,
+                    token_id INTEGER NOT NULL,
+                    username TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    profile_url TEXT,
+                    instruction_set TEXT,
+                    safety_instruction_set TEXT,
+                    visibility TEXT DEFAULT 'private',
+                    status TEXT DEFAULT 'finalized',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (token_id) REFERENCES tokens(id)
+                )
+            """)
+
+            # WebDAV config table
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS webdav_config (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    webdav_enabled BOOLEAN DEFAULT 0,
+                    webdav_url TEXT,
+                    webdav_username TEXT,
+                    webdav_password TEXT,
+                    webdav_upload_path TEXT DEFAULT '/video',
+                    auto_delete_enabled BOOLEAN DEFAULT 0,
+                    auto_delete_days INTEGER DEFAULT 30,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Video records table
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS video_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    token_id INTEGER NOT NULL,
+                    original_url TEXT NOT NULL,
+                    watermark_free_url TEXT,
+                    webdav_path TEXT,
+                    webdav_url TEXT,
+                    file_size INTEGER,
+                    status TEXT DEFAULT 'pending',
+                    error_message TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    uploaded_at TIMESTAMP,
+                    deleted_at TIMESTAMP,
+                    FOREIGN KEY (token_id) REFERENCES tokens(id)
+                )
+            """)
+
+            # Upload logs table
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS upload_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    video_record_id INTEGER,
+                    operation TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    message TEXT,
+                    duration FLOAT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (video_record_id) REFERENCES video_records(id)
+                )
+            """)
+
             # Create indexes
             await db.execute("CREATE INDEX IF NOT EXISTS idx_task_id ON tasks(task_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_token_active ON tokens(is_active)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_character_cameo_id ON characters(cameo_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_character_token_id ON characters(token_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_video_record_task_id ON video_records(task_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_video_record_status ON video_records(status)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_upload_log_video_record_id ON upload_logs(video_record_id)")
 
             # Migration: Add daily statistics columns if they don't exist
             if not await self._column_exists(db, "token_stats", "today_image_count"):
@@ -452,6 +802,8 @@ class Database:
                 await db.execute("ALTER TABLE token_stats ADD COLUMN today_date DATE")
 
             await db.commit()
+        finally:
+            await db.close()
 
     async def init_config_from_toml(self, config_dict: dict, is_first_startup: bool = True):
         """
@@ -475,7 +827,7 @@ class Database:
     # Token operations
     async def add_token(self, token: Token) -> int:
         """Add a new token"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cursor = await db.execute("""
                 INSERT INTO tokens (token, email, username, name, st, rt, client_id, proxy_url, remark, expiry_time, is_active,
                                    plan_type, plan_title, subscription_end, sora2_supported, sora2_invite_code,
@@ -503,7 +855,7 @@ class Database:
     
     async def get_token(self, token_id: int) -> Optional[Token]:
         """Get token by ID"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM tokens WHERE id = ?", (token_id,))
             row = await cursor.fetchone()
@@ -513,7 +865,7 @@ class Database:
     
     async def get_token_by_value(self, token: str) -> Optional[Token]:
         """Get token by value"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM tokens WHERE token = ?", (token,))
             row = await cursor.fetchone()
@@ -523,7 +875,7 @@ class Database:
 
     async def get_token_by_email(self, email: str) -> Optional[Token]:
         """Get token by email"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM tokens WHERE email = ?", (email,))
             row = await cursor.fetchone()
@@ -533,21 +885,31 @@ class Database:
     
     async def get_active_tokens(self) -> List[Token]:
         """Get all active tokens (enabled, not cooled down, not expired)"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute("""
-                SELECT * FROM tokens
-                WHERE is_active = 1
-                AND (cooled_until IS NULL OR cooled_until < CURRENT_TIMESTAMP)
-                AND expiry_time > CURRENT_TIMESTAMP
-                ORDER BY last_used_at ASC NULLS FIRST
-            """)
+            # MySQL doesn't support NULLS FIRST, use COALESCE or CASE instead
+            if self.db_type == "mysql":
+                cursor = await db.execute("""
+                    SELECT * FROM tokens
+                    WHERE is_active = 1
+                    AND (cooled_until IS NULL OR cooled_until < CURRENT_TIMESTAMP)
+                    AND expiry_time > CURRENT_TIMESTAMP
+                    ORDER BY CASE WHEN last_used_at IS NULL THEN 0 ELSE 1 END, last_used_at ASC
+                """)
+            else:
+                cursor = await db.execute("""
+                    SELECT * FROM tokens
+                    WHERE is_active = 1
+                    AND (cooled_until IS NULL OR cooled_until < CURRENT_TIMESTAMP)
+                    AND expiry_time > CURRENT_TIMESTAMP
+                    ORDER BY last_used_at ASC NULLS FIRST
+                """)
             rows = await cursor.fetchall()
             return [Token(**dict(row)) for row in rows]
     
     async def get_all_tokens(self) -> List[Token]:
         """Get all tokens"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM tokens ORDER BY created_at DESC")
             rows = await cursor.fetchall()
@@ -555,52 +917,112 @@ class Database:
     
     async def update_token_usage(self, token_id: int):
         """Update token usage"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                UPDATE tokens 
-                SET last_used_at = CURRENT_TIMESTAMP, use_count = use_count + 1
-                WHERE id = ?
-            """, (token_id,))
-            await db.commit()
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with self._connect() as db:
+                    await db.execute("""
+                        UPDATE tokens 
+                        SET last_used_at = CURRENT_TIMESTAMP, use_count = use_count + 1
+                        WHERE id = ?
+                    """, (token_id,))
+                    await db.commit()
+                    return
+            except Exception as e:
+                error_msg = str(e)
+                # MySQL/TiDB optimistic lock conflict
+                if "1020" in error_msg or "Record has changed" in error_msg or "Deadlock" in error_msg:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+                        continue
+                raise
     
     async def update_token_status(self, token_id: int, is_active: bool):
-        """Update token status"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                UPDATE tokens SET is_active = ? WHERE id = ?
-            """, (is_active, token_id))
-            await db.commit()
+        """Update token status with retry for concurrent updates"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with self._connect() as db:
+                    await db.execute("""
+                        UPDATE tokens SET is_active = ? WHERE id = ?
+                    """, (is_active, token_id))
+                    await db.commit()
+                    return
+            except Exception as e:
+                error_msg = str(e)
+                # MySQL error 1020: Record has changed since last read
+                if "1020" in error_msg or "Record has changed" in error_msg:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+                        continue
+                raise
     
     async def update_token_sora2(self, token_id: int, supported: bool, invite_code: Optional[str] = None,
                                 redeemed_count: int = 0, total_count: int = 0, remaining_count: int = 0):
-        """Update token Sora2 support info"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                UPDATE tokens
-                SET sora2_supported = ?, sora2_invite_code = ?, sora2_redeemed_count = ?, sora2_total_count = ?, sora2_remaining_count = ?
-                WHERE id = ?
-            """, (supported, invite_code, redeemed_count, total_count, remaining_count, token_id))
-            await db.commit()
+        """Update token Sora2 support info with retry for concurrent updates"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with self._connect() as db:
+                    await db.execute("""
+                        UPDATE tokens
+                        SET sora2_supported = ?, sora2_invite_code = ?, sora2_redeemed_count = ?, sora2_total_count = ?, sora2_remaining_count = ?
+                        WHERE id = ?
+                    """, (supported, invite_code, redeemed_count, total_count, remaining_count, token_id))
+                    await db.commit()
+                    return
+            except Exception as e:
+                error_msg = str(e)
+                # MySQL error 1020: Record has changed since last read
+                if "1020" in error_msg or "Record has changed" in error_msg:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+                        continue
+                raise
 
     async def update_token_sora2_remaining(self, token_id: int, remaining_count: int):
-        """Update token Sora2 remaining count"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                UPDATE tokens SET sora2_remaining_count = ? WHERE id = ?
-            """, (remaining_count, token_id))
-            await db.commit()
+        """Update token Sora2 remaining count with retry for concurrent updates"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with self._connect() as db:
+                    await db.execute("""
+                        UPDATE tokens SET sora2_remaining_count = ? WHERE id = ?
+                    """, (remaining_count, token_id))
+                    await db.commit()
+                    return
+            except Exception as e:
+                error_msg = str(e)
+                # MySQL error 1020: Record has changed since last read
+                if "1020" in error_msg or "Record has changed" in error_msg:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+                        continue
+                raise
 
     async def update_token_sora2_cooldown(self, token_id: int, cooldown_until: Optional[datetime]):
-        """Update token Sora2 cooldown time"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                UPDATE tokens SET sora2_cooldown_until = ? WHERE id = ?
-            """, (cooldown_until, token_id))
-            await db.commit()
+        """Update token Sora2 cooldown time with retry for concurrent updates"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with self._connect() as db:
+                    await db.execute("""
+                        UPDATE tokens SET sora2_cooldown_until = ? WHERE id = ?
+                    """, (cooldown_until, token_id))
+                    await db.commit()
+                    return
+            except Exception as e:
+                error_msg = str(e)
+                # MySQL error 1020: Record has changed since last read
+                if "1020" in error_msg or "Record has changed" in error_msg:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+                        continue
+                raise
 
     async def update_token_cooldown(self, token_id: int, cooled_until: datetime):
         """Update token cooldown"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("""
                 UPDATE tokens SET cooled_until = ? WHERE id = ?
             """, (cooled_until, token_id))
@@ -608,7 +1030,7 @@ class Database:
     
     async def delete_token(self, token_id: int):
         """Delete token"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("DELETE FROM token_stats WHERE token_id = ?", (token_id,))
             await db.execute("DELETE FROM tokens WHERE id = ?", (token_id,))
             await db.commit()
@@ -629,7 +1051,7 @@ class Database:
                           image_concurrency: Optional[int] = None,
                           video_concurrency: Optional[int] = None):
         """Update token (AT, ST, RT, client_id, proxy_url, remark, expiry_time, subscription info, image_enabled, video_enabled)"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             # Build dynamic update query
             updates = []
             params = []
@@ -699,210 +1121,565 @@ class Database:
     # Token stats operations
     async def get_token_stats(self, token_id: int) -> Optional[TokenStats]:
         """Get token statistics"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM token_stats WHERE token_id = ?", (token_id,))
             row = await cursor.fetchone()
             if row:
-                return TokenStats(**dict(row))
+                data = dict(row)
+                # Convert date object to string for Pydantic compatibility
+                if data.get("today_date") and not isinstance(data["today_date"], str):
+                    data["today_date"] = str(data["today_date"])
+                return TokenStats(**data)
             return None
-    
-    async def increment_image_count(self, token_id: int):
-        """Increment image generation count"""
-        from datetime import date
-        async with aiosqlite.connect(self.db_path) as db:
-            today = str(date.today())
-            # Get current stats
-            cursor = await db.execute("SELECT today_date FROM token_stats WHERE token_id = ?", (token_id,))
-            row = await cursor.fetchone()
 
-            # If date changed, reset today's count
-            if row and row[0] != today:
-                await db.execute("""
-                    UPDATE token_stats
-                    SET image_count = image_count + 1,
-                        today_image_count = 1,
-                        today_date = ?
-                    WHERE token_id = ?
-                """, (today, token_id))
-            else:
-                # Same day, just increment both
-                await db.execute("""
-                    UPDATE token_stats
-                    SET image_count = image_count + 1,
-                        today_image_count = today_image_count + 1,
-                        today_date = ?
-                    WHERE token_id = ?
-                """, (today, token_id))
+    async def get_all_token_stats(self) -> Dict[int, TokenStats]:
+        """Get statistics for all tokens in a single query (optimized for N+1)
+
+        Returns:
+            Dictionary mapping token_id to TokenStats
+        """
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM token_stats")
+            rows = await cursor.fetchall()
+            result = {}
+            for row in rows:
+                data = dict(row)
+                # Convert date object to string for Pydantic compatibility
+                if data.get("today_date") and not isinstance(data["today_date"], str):
+                    data["today_date"] = str(data["today_date"])
+                token_id = data.get("token_id")
+                if token_id:
+                    result[token_id] = TokenStats(**data)
+            return result
+
+    async def ensure_token_stats_row(self, token_id: int):
+        """Ensure a stats row exists for a token (safe for SQLite/MySQL)"""
+        async with self._connect() as db:
+            await db.execute("""
+                INSERT INTO token_stats (token_id)
+                SELECT ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM token_stats WHERE token_id = ?
+                )
+            """, (token_id, token_id))
             await db.commit()
+
+    async def ensure_token_stats_rows(self):
+        """Ensure stats rows exist for all tokens"""
+        async with self._connect() as db:
+            await db.execute("""
+                INSERT INTO token_stats (token_id)
+                SELECT t.id
+                FROM tokens t
+                LEFT JOIN token_stats s ON s.token_id = t.id
+                WHERE s.token_id IS NULL
+            """)
+            await db.commit()
+
+    async def get_stats(self) -> dict:
+        """Get aggregated statistics across all tokens"""
+        from datetime import date
+        async with self._connect() as db:
+            today = str(date.today())
+            cursor = await db.execute("""
+                SELECT 
+                    SUM(image_count) as total_images,
+                    SUM(video_count) as total_videos,
+                    SUM(error_count) as total_errors,
+                    SUM(CASE WHEN today_date = ? THEN today_image_count ELSE 0 END) as today_images,
+                    SUM(CASE WHEN today_date = ? THEN today_video_count ELSE 0 END) as today_videos,
+                    SUM(CASE WHEN today_date = ? THEN today_error_count ELSE 0 END) as today_errors
+                FROM token_stats
+            """, (today, today, today))
+            row = await cursor.fetchone()
+            if row:
+                if isinstance(row, dict):
+                    return {
+                        "total_images": row.get("total_images") or 0,
+                        "total_videos": row.get("total_videos") or 0,
+                        "total_errors": row.get("total_errors") or 0,
+                        "today_images": row.get("today_images") or 0,
+                        "today_videos": row.get("today_videos") or 0,
+                        "today_errors": row.get("today_errors") or 0
+                    }
+                else:
+                    return {
+                        "total_images": row[0] or 0,
+                        "total_videos": row[1] or 0,
+                        "total_errors": row[2] or 0,
+                        "today_images": row[3] or 0,
+                        "today_videos": row[4] or 0,
+                        "today_errors": row[5] or 0
+                    }
+            return {
+                "total_images": 0,
+                "total_videos": 0,
+                "total_errors": 0,
+                "today_images": 0,
+                "today_videos": 0,
+                "today_errors": 0
+            }
+
+    async def cleanup_stale_tasks(self, image_timeout: Optional[int] = None, video_timeout: Optional[int] = None):
+        """Mark stale in-progress tasks as failed based on timeout"""
+        from datetime import datetime, timedelta
+        image_timeout = image_timeout if image_timeout is not None else config.image_timeout
+        video_timeout = video_timeout if video_timeout is not None else config.video_timeout
+        cutoff_image = (datetime.now() - timedelta(seconds=image_timeout)).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff_video = (datetime.now() - timedelta(seconds=video_timeout)).strftime("%Y-%m-%d %H:%M:%S")
+
+        async with self._connect() as db:
+            await db.execute("""
+                UPDATE tasks
+                SET status = 'failed',
+                    error_message = COALESCE(error_message, 'Stale in_progress timeout'),
+                    completed_at = CURRENT_TIMESTAMP
+                WHERE status IN ('processing','in_progress')
+                  AND (
+                        (model LIKE 'sora-video%%' AND created_at < ?)
+                     OR (model NOT LIKE 'sora-video%%' AND created_at < ?)
+                  )
+            """, (cutoff_video, cutoff_image))
+            await db.commit()
+
+    async def get_inflight_counts(self) -> dict:
+        """Get current in-flight task counts by request interface type"""
+        from datetime import datetime, timedelta
+        cutoff_image = (datetime.now() - timedelta(seconds=config.image_timeout)).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff_video = (datetime.now() - timedelta(seconds=config.video_timeout)).strftime("%Y-%m-%d %H:%M:%S")
+
+        async with self._connect() as db:
+            cursor = await db.execute("""
+                SELECT 
+                    SUM(CASE 
+                        WHEN status IN ('processing','in_progress')
+                             AND task_id LIKE 'task_%%'
+                             AND (
+                                    (model LIKE 'sora-video%%' AND created_at >= ?)
+                                 OR (model NOT LIKE 'sora-video%%' AND created_at >= ?)
+                                 )
+                        THEN 1 ELSE 0 END) as chat_inflight,
+                    SUM(CASE 
+                        WHEN status IN ('processing','in_progress')
+                             AND task_id NOT LIKE 'task_%%'
+                             AND (
+                                    (model LIKE 'sora-video%%' AND created_at >= ?)
+                                 OR (model NOT LIKE 'sora-video%%' AND created_at >= ?)
+                                 )
+                        THEN 1 ELSE 0 END) as video_inflight
+                FROM tasks
+            """, (cutoff_video, cutoff_image, cutoff_video, cutoff_image))
+            row = await cursor.fetchone()
+            if row:
+                if isinstance(row, dict):
+                    return {
+                        "chat_inflight": row.get("chat_inflight") or 0,
+                        "video_inflight": row.get("video_inflight") or 0
+                    }
+                return {
+                    "chat_inflight": row[0] or 0,
+                    "video_inflight": row[1] or 0
+                }
+            return {"chat_inflight": 0, "video_inflight": 0}
+
+    async def increment_image_count(self, token_id: int):
+        """Increment image generation count - uses row-level lock for MySQL"""
+        from datetime import date
+        today = str(date.today())
+
+        if self.db_type == "mysql":
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    # MySQL: use SELECT FOR UPDATE to lock the row, then update
+                    import aiomysql
+                    pool = await self._get_mysql_pool()
+                    async with pool.acquire() as conn:
+                        async with conn.cursor() as cursor:
+                            # Lock the row first
+                            await cursor.execute(
+                                "SELECT id FROM token_stats WHERE token_id = %s FOR UPDATE",
+                                (token_id,)
+                            )
+                            row = await cursor.fetchone()
+                            if not row:
+                                await cursor.execute(
+                                    "INSERT INTO token_stats (token_id) VALUES (%s)",
+                                    (token_id,)
+                                )
+                            # Now update atomically
+                            await cursor.execute("""
+                                UPDATE token_stats
+                                SET image_count = image_count + 1,
+                                    today_image_count = IF(today_date = %s, today_image_count + 1, 1),
+                                    today_date = %s
+                                WHERE token_id = %s
+                            """, (today, today, token_id))
+                            await conn.commit()
+                            return
+                except Exception as e:
+                    error_msg = str(e)
+                    if "1020" in error_msg or "Record has changed" in error_msg or "Deadlock" in error_msg:
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(0.1 * (attempt + 1))
+                            continue
+                    raise
+        else:
+            # SQLite: simple atomic update
+            async with self._connect() as db:
+                await db.execute("""
+                    INSERT INTO token_stats (token_id)
+                    SELECT ?
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM token_stats WHERE token_id = ?
+                    )
+                """, (token_id, token_id))
+                await db.execute("""
+                    UPDATE token_stats
+                    SET image_count = image_count + 1,
+                        today_image_count = CASE WHEN today_date = ? THEN today_image_count + 1 ELSE 1 END,
+                        today_date = ?
+                    WHERE token_id = ?
+                """, (today, today, token_id))
+                await db.commit()
 
     async def increment_video_count(self, token_id: int):
-        """Increment video generation count"""
+        """Increment video generation count - uses row-level lock for MySQL"""
         from datetime import date
-        async with aiosqlite.connect(self.db_path) as db:
-            today = str(date.today())
-            # Get current stats
-            cursor = await db.execute("SELECT today_date FROM token_stats WHERE token_id = ?", (token_id,))
-            row = await cursor.fetchone()
+        today = str(date.today())
 
-            # If date changed, reset today's count
-            if row and row[0] != today:
+        if self.db_type == "mysql":
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    # MySQL: use SELECT FOR UPDATE to lock the row, then update
+                    import aiomysql
+                    pool = await self._get_mysql_pool()
+                    async with pool.acquire() as conn:
+                        async with conn.cursor() as cursor:
+                            # Lock the row first
+                            await cursor.execute(
+                                "SELECT id FROM token_stats WHERE token_id = %s FOR UPDATE",
+                                (token_id,)
+                            )
+                            row = await cursor.fetchone()
+                            if not row:
+                                await cursor.execute(
+                                    "INSERT INTO token_stats (token_id) VALUES (%s)",
+                                    (token_id,)
+                                )
+                            # Now update atomically
+                            await cursor.execute("""
+                                UPDATE token_stats
+                                SET video_count = video_count + 1,
+                                    today_video_count = IF(today_date = %s, today_video_count + 1, 1),
+                                    today_date = %s
+                                WHERE token_id = %s
+                            """, (today, today, token_id))
+                            await conn.commit()
+                            return
+                except Exception as e:
+                    error_msg = str(e)
+                    if "1020" in error_msg or "Record has changed" in error_msg or "Deadlock" in error_msg:
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(0.1 * (attempt + 1))
+                            continue
+                    raise
+        else:
+            # SQLite: simple atomic update
+            async with self._connect() as db:
+                await db.execute("""
+                    INSERT INTO token_stats (token_id)
+                    SELECT ?
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM token_stats WHERE token_id = ?
+                    )
+                """, (token_id, token_id))
                 await db.execute("""
                     UPDATE token_stats
                     SET video_count = video_count + 1,
-                        today_video_count = 1,
+                        today_video_count = CASE WHEN today_date = ? THEN today_video_count + 1 ELSE 1 END,
                         today_date = ?
                     WHERE token_id = ?
-                """, (today, token_id))
-            else:
-                # Same day, just increment both
-                await db.execute("""
-                    UPDATE token_stats
-                    SET video_count = video_count + 1,
-                        today_video_count = today_video_count + 1,
-                        today_date = ?
-                    WHERE token_id = ?
-                """, (today, token_id))
-            await db.commit()
+                """, (today, today, token_id))
+                await db.commit()
     
-    async def increment_error_count(self, token_id: int, increment_consecutive: bool = True):
-        """Increment error count
-
-        Args:
-            token_id: Token ID
-            increment_consecutive: Whether to increment consecutive error count (False for overload errors)
-        """
+    async def increment_error_count(self, token_id: int):
+        """Increment error count - uses row-level lock for MySQL"""
         from datetime import date
-        async with aiosqlite.connect(self.db_path) as db:
-            today = str(date.today())
-            # Get current stats
-            cursor = await db.execute("SELECT today_date FROM token_stats WHERE token_id = ?", (token_id,))
-            row = await cursor.fetchone()
+        today = str(date.today())
 
-            # If date changed, reset today's error count
-            if row and row[0] != today:
-                if increment_consecutive:
-                    await db.execute("""
-                        UPDATE token_stats
-                        SET error_count = error_count + 1,
-                            consecutive_error_count = consecutive_error_count + 1,
-                            today_error_count = 1,
-                            today_date = ?,
-                            last_error_at = CURRENT_TIMESTAMP
-                        WHERE token_id = ?
-                    """, (today, token_id))
-                else:
-                    await db.execute("""
-                        UPDATE token_stats
-                        SET error_count = error_count + 1,
-                            today_error_count = 1,
-                            today_date = ?,
-                            last_error_at = CURRENT_TIMESTAMP
-                        WHERE token_id = ?
-                    """, (today, token_id))
-            else:
-                # Same day, just increment counters
-                if increment_consecutive:
-                    await db.execute("""
-                        UPDATE token_stats
-                        SET error_count = error_count + 1,
-                            consecutive_error_count = consecutive_error_count + 1,
-                            today_error_count = today_error_count + 1,
-                            today_date = ?,
-                            last_error_at = CURRENT_TIMESTAMP
-                        WHERE token_id = ?
-                    """, (today, token_id))
-                else:
-                    await db.execute("""
-                        UPDATE token_stats
-                        SET error_count = error_count + 1,
-                            today_error_count = today_error_count + 1,
-                            today_date = ?,
-                            last_error_at = CURRENT_TIMESTAMP
-                        WHERE token_id = ?
-                    """, (today, token_id))
-            await db.commit()
+        if self.db_type == "mysql":
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    # MySQL: use SELECT FOR UPDATE to lock the row, then update
+                    import aiomysql
+                    pool = await self._get_mysql_pool()
+                    async with pool.acquire() as conn:
+                        async with conn.cursor() as cursor:
+                            # Lock the row first
+                            await cursor.execute(
+                                "SELECT id FROM token_stats WHERE token_id = %s FOR UPDATE",
+                                (token_id,)
+                            )
+                            row = await cursor.fetchone()
+                            if not row:
+                                await cursor.execute(
+                                    "INSERT INTO token_stats (token_id) VALUES (%s)",
+                                    (token_id,)
+                                )
+                            # Now update atomically
+                            await cursor.execute("""
+                                UPDATE token_stats
+                                SET error_count = error_count + 1,
+                                    consecutive_error_count = consecutive_error_count + 1,
+                                    today_error_count = IF(today_date = %s, today_error_count + 1, 1),
+                                    today_date = %s,
+                                    last_error_at = CURRENT_TIMESTAMP
+                                WHERE token_id = %s
+                            """, (today, today, token_id))
+                            await conn.commit()
+                            return
+                except Exception as e:
+                    error_msg = str(e)
+                    if "1020" in error_msg or "Record has changed" in error_msg or "Deadlock" in error_msg:
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(0.1 * (attempt + 1))
+                            continue
+                    raise
+        else:
+            # SQLite: simple atomic update
+            async with self._connect() as db:
+                await db.execute("""
+                    INSERT INTO token_stats (token_id)
+                    SELECT ?
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM token_stats WHERE token_id = ?
+                    )
+                """, (token_id, token_id))
+                await db.execute("""
+                    UPDATE token_stats
+                    SET error_count = error_count + 1,
+                        consecutive_error_count = consecutive_error_count + 1,
+                        today_error_count = CASE WHEN today_date = ? THEN today_error_count + 1 ELSE 1 END,
+                        today_date = ?,
+                        last_error_at = CURRENT_TIMESTAMP
+                    WHERE token_id = ?
+                """, (today, today, token_id))
+                await db.commit()
     
     async def reset_error_count(self, token_id: int):
-        """Reset consecutive error count (keep total error_count)"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                UPDATE token_stats SET consecutive_error_count = 0 WHERE token_id = ?
-            """, (token_id,))
-            await db.commit()
+        """Reset consecutive error count - uses row-level lock for MySQL"""
+        if self.db_type == "mysql":
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    # MySQL: use SELECT FOR UPDATE to lock the row, then update
+                    import aiomysql
+                    pool = await self._get_mysql_pool()
+                    async with pool.acquire() as conn:
+                        async with conn.cursor() as cursor:
+                            # Lock the row first
+                            await cursor.execute(
+                                "SELECT id FROM token_stats WHERE token_id = %s FOR UPDATE",
+                                (token_id,)
+                            )
+                            # Now update atomically
+                            await cursor.execute(
+                                "UPDATE token_stats SET consecutive_error_count = 0 WHERE token_id = %s",
+                                (token_id,)
+                            )
+                            await conn.commit()
+                            return
+                except Exception as e:
+                    error_msg = str(e)
+                    if "1020" in error_msg or "Record has changed" in error_msg or "Deadlock" in error_msg:
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(0.1 * (attempt + 1))
+                            continue
+                    raise
+        else:
+            # SQLite: simple update
+            async with self._connect() as db:
+                await db.execute("""
+                    UPDATE token_stats SET consecutive_error_count = 0 WHERE token_id = ?
+                """, (token_id,))
+                await db.commit()
     
     # Task operations
     async def create_task(self, task: Task) -> int:
         """Create a new task"""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("""
-                INSERT INTO tasks (task_id, token_id, model, prompt, status, progress)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (task.task_id, task.token_id, task.model, task.prompt, task.status, task.progress))
-            await db.commit()
-            return cursor.lastrowid
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with self._connect() as db:
+                    cursor = await db.execute("""
+                        INSERT INTO tasks (task_id, token_id, model, prompt, status, progress)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (task.task_id, task.token_id, task.model, task.prompt, task.status, task.progress))
+                    await db.commit()
+                    return cursor.lastrowid
+            except Exception as e:
+                error_msg = str(e)
+                if "1020" in error_msg or "Record has changed" in error_msg or "Deadlock" in error_msg:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+                        continue
+                raise
     
     async def update_task(self, task_id: str, status: str, progress: float, 
                          result_urls: Optional[str] = None, error_message: Optional[str] = None):
         """Update task status"""
-        async with aiosqlite.connect(self.db_path) as db:
-            completed_at = datetime.now() if status in ["completed", "failed"] else None
-            await db.execute("""
-                UPDATE tasks 
-                SET status = ?, progress = ?, result_urls = ?, error_message = ?, completed_at = ?
-                WHERE task_id = ?
-            """, (status, progress, result_urls, error_message, completed_at, task_id))
-            await db.commit()
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with self._connect() as db:
+                    completed_at = datetime.now() if status in ["completed", "failed", "cancelled"] else None
+                    await db.execute("""
+                        UPDATE tasks 
+                        SET status = ?, progress = ?, result_urls = ?, error_message = ?, completed_at = ?
+                        WHERE task_id = ?
+                    """, (status, progress, result_urls, error_message, completed_at, task_id))
+                    await db.commit()
+                    return
+            except Exception as e:
+                error_msg = str(e)
+                if "1020" in error_msg or "Record has changed" in error_msg or "Deadlock" in error_msg:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+                        continue
+                raise
     
     async def get_task(self, task_id: str) -> Optional[Task]:
         """Get task by ID"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
             row = await cursor.fetchone()
             if row:
                 return Task(**dict(row))
             return None
-    
+
+    async def get_recent_tasks(self, limit: int = 10) -> List[Task]:
+        """Get recent tasks ordered by creation time"""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,)
+            )
+            rows = await cursor.fetchall()
+            return [Task(**dict(row)) for row in rows]
+
     # Request log operations
     async def log_request(self, log: RequestLog) -> int:
         """Log a request and return log ID"""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("""
-                INSERT INTO request_logs (token_id, task_id, operation, request_body, response_body, status_code, duration)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (log.token_id, log.task_id, log.operation, log.request_body, log.response_body,
-                  log.status_code, log.duration))
-            await db.commit()
-            return cursor.lastrowid
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with self._connect() as db:
+                    cursor = await db.execute("""
+                        INSERT INTO request_logs (token_id, task_id, operation, request_body, response_body, status_code, duration)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (log.token_id, log.task_id, log.operation, log.request_body, log.response_body,
+                          log.status_code, log.duration))
+                    await db.commit()
+                    return cursor.lastrowid
+            except Exception as e:
+                error_msg = str(e)
+                if "1020" in error_msg or "Record has changed" in error_msg or "Deadlock" in error_msg:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+                        continue
+                raise
 
     async def update_request_log(self, log_id: int, response_body: Optional[str] = None,
                                  status_code: Optional[int] = None, duration: Optional[float] = None):
         """Update request log with completion data"""
-        async with aiosqlite.connect(self.db_path) as db:
-            updates = []
-            params = []
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with self._connect() as db:
+                    updates = []
+                    params = []
 
-            if response_body is not None:
-                updates.append("response_body = ?")
-                params.append(response_body)
-            if status_code is not None:
-                updates.append("status_code = ?")
-                params.append(status_code)
-            if duration is not None:
-                updates.append("duration = ?")
-                params.append(duration)
+                    if response_body is not None:
+                        updates.append("response_body = ?")
+                        params.append(response_body)
+                    if status_code is not None:
+                        updates.append("status_code = ?")
+                        params.append(status_code)
+                    if duration is not None:
+                        updates.append("duration = ?")
+                        params.append(duration)
 
-            if updates:
-                updates.append("updated_at = CURRENT_TIMESTAMP")
-                params.append(log_id)
-                query = f"UPDATE request_logs SET {', '.join(updates)} WHERE id = ?"
-                await db.execute(query, params)
-                await db.commit()
-    
+                    if updates:
+                        updates.append("updated_at = CURRENT_TIMESTAMP")
+                        params.append(log_id)
+                        query = f"UPDATE request_logs SET {', '.join(updates)} WHERE id = ?"
+                        await db.execute(query, params)
+                        await db.commit()
+                return
+            except Exception as e:
+                error_msg = str(e)
+                if "1020" in error_msg or "Record has changed" in error_msg or "Deadlock" in error_msg:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+                        continue
+                raise
+
+    async def update_request_log_by_task_id(self, task_id: str, response_body: Optional[str] = None,
+                                            status_code: Optional[int] = None, duration: Optional[float] = None):
+        """Update latest in-progress request log for a task"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with self._connect() as db:
+                    updates = []
+                    params = []
+
+                    if response_body is not None:
+                        updates.append("response_body = ?")
+                        params.append(response_body)
+                    if status_code is not None:
+                        updates.append("status_code = ?")
+                        params.append(status_code)
+                    if duration is not None:
+                        updates.append("duration = ?")
+                        params.append(duration)
+
+                    if updates:
+                        updates.append("updated_at = CURRENT_TIMESTAMP")
+                        params.append(task_id)
+                        query = f"""
+                            UPDATE request_logs
+                            SET {', '.join(updates)}
+                            WHERE id = (
+                                SELECT id FROM (
+                                    SELECT id
+                                    FROM request_logs
+                                    WHERE task_id = ? AND status_code = -1
+                                    ORDER BY id DESC
+                                    LIMIT 1
+                                ) AS sub
+                            )
+                        """
+                        await db.execute(query, params)
+                        await db.commit()
+                return
+            except Exception as e:
+                error_msg = str(e)
+                if "1020" in error_msg or "Record has changed" in error_msg or "Deadlock" in error_msg:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+                        continue
+                raise
+
     async def get_recent_logs(self, limit: int = 100) -> List[dict]:
-        """Get recent logs with token email"""
-        async with aiosqlite.connect(self.db_path) as db:
+        """Get recent logs with token email and task progress"""
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("""
                 SELECT
@@ -934,7 +1711,7 @@ class Database:
     # Admin config operations
     async def get_admin_config(self) -> AdminConfig:
         """Get admin configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM admin_config WHERE id = 1")
             row = await cursor.fetchone()
@@ -946,7 +1723,7 @@ class Database:
     
     async def update_admin_config(self, config: AdminConfig):
         """Update admin configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("""
                 UPDATE admin_config
                 SET admin_username = ?, admin_password = ?, api_key = ?, error_ban_threshold = ?, updated_at = CURRENT_TIMESTAMP
@@ -957,7 +1734,7 @@ class Database:
     # Proxy config operations
     async def get_proxy_config(self) -> ProxyConfig:
         """Get proxy configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM proxy_config WHERE id = 1")
             row = await cursor.fetchone()
@@ -967,20 +1744,49 @@ class Database:
             # This should not happen in normal operation as _ensure_config_rows should create it
             return ProxyConfig(proxy_enabled=False)
     
-    async def update_proxy_config(self, enabled: bool, proxy_url: Optional[str]):
-        """Update proxy configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                UPDATE proxy_config
-                SET proxy_enabled = ?, proxy_url = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = 1
-            """, (enabled, proxy_url))
-            await db.commit()
+    async def update_proxy_config(self, enabled: bool, proxy_url: Optional[str], proxy_pool_enabled: bool = False):
+        """Update proxy configuration with retry for optimistic lock conflicts
+
+        Uses INSERT ... ON CONFLICT for SQLite or INSERT ... ON DUPLICATE KEY UPDATE for MySQL/TiDB
+        """
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with self._connect() as db:
+                    # First check if row exists
+                    cursor = await db.execute("SELECT COUNT(*) FROM proxy_config WHERE id = 1")
+                    count = await cursor.fetchone()
+                    row_exists = self._get_count_value(count) > 0
+
+                    if row_exists:
+                        # Update existing row
+                        await db.execute("""
+                            UPDATE proxy_config 
+                            SET proxy_enabled = ?, proxy_url = ?, proxy_pool_enabled = ?, updated_at = CURRENT_TIMESTAMP
+                            WHERE id = 1
+                        """, (enabled, proxy_url, proxy_pool_enabled))
+                    else:
+                        # Insert new row
+                        await db.execute("""
+                            INSERT INTO proxy_config (id, proxy_enabled, proxy_url, proxy_pool_enabled, updated_at)
+                            VALUES (1, ?, ?, ?, CURRENT_TIMESTAMP)
+                        """, (enabled, proxy_url, proxy_pool_enabled))
+                    await db.commit()
+                    return
+            except Exception as e:
+                error_msg = str(e)
+                # Handle TiDB/MySQL optimistic lock conflict (error 1020)
+                if "1020" in error_msg or "Record has changed" in error_msg or "Deadlock" in error_msg:
+                    if attempt < max_retries - 1:
+                        import asyncio
+                        await asyncio.sleep(0.1 * (attempt + 1))
+                        continue
+                raise
 
     # Watermark-free config operations
     async def get_watermark_free_config(self) -> WatermarkFreeConfig:
         """Get watermark-free configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM watermark_free_config WHERE id = 1")
             row = await cursor.fetchone()
@@ -993,8 +1799,19 @@ class Database:
     async def update_watermark_free_config(self, enabled: bool, parse_method: str = None,
                                           custom_parse_url: str = None, custom_parse_token: str = None):
         """Update watermark-free configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
-            if parse_method is None and custom_parse_url is None and custom_parse_token is None:
+        async with self._connect() as db:
+            # First check if row exists
+            cursor = await db.execute("SELECT COUNT(*) FROM watermark_free_config WHERE id = 1")
+            count = await cursor.fetchone()
+            row_exists = self._get_count_value(count) > 0
+
+            if not row_exists:
+                # Insert if not exists
+                await db.execute("""
+                    INSERT INTO watermark_free_config (id, watermark_free_enabled, parse_method, custom_parse_url, custom_parse_token)
+                    VALUES (1, ?, ?, ?, ?)
+                """, (enabled, parse_method or "third_party", custom_parse_url, custom_parse_token))
+            elif parse_method is None and custom_parse_url is None and custom_parse_token is None:
                 # Only update enabled status
                 await db.execute("""
                     UPDATE watermark_free_config
@@ -1014,7 +1831,7 @@ class Database:
     # Cache config operations
     async def get_cache_config(self) -> CacheConfig:
         """Get cache configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM cache_config WHERE id = 1")
             row = await cursor.fetchone()
@@ -1025,38 +1842,48 @@ class Database:
             return CacheConfig(cache_enabled=False, cache_timeout=600)
 
     async def update_cache_config(self, enabled: bool = None, timeout: int = None, base_url: Optional[str] = None):
-        """Update cache configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
-            # Get current config first
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM cache_config WHERE id = 1")
-            row = await cursor.fetchone()
-
-            if row:
-                current = dict(row)
-                # Update only provided fields
-                new_enabled = enabled if enabled is not None else current.get("cache_enabled", False)
-                new_timeout = timeout if timeout is not None else current.get("cache_timeout", 600)
-                new_base_url = base_url if base_url is not None else current.get("cache_base_url")
-            else:
-                new_enabled = enabled if enabled is not None else False
-                new_timeout = timeout if timeout is not None else 600
-                new_base_url = base_url
-
+        """Update cache configuration - uses atomic COALESCE to avoid read-then-write"""
+        async with self._connect() as db:
             # Convert empty string to None
-            new_base_url = new_base_url if new_base_url else None
+            new_base_url = base_url if base_url else None
 
-            await db.execute("""
-                UPDATE cache_config
-                SET cache_enabled = ?, cache_timeout = ?, cache_base_url = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = 1
-            """, (new_enabled, new_timeout, new_base_url))
+            # First check if row exists
+            cursor = await db.execute("SELECT COUNT(*) FROM cache_config WHERE id = 1")
+            count = await cursor.fetchone()
+            row_exists = self._get_count_value(count) > 0
+
+            if not row_exists:
+                # Insert if not exists
+                await db.execute("""
+                    INSERT INTO cache_config (id, cache_enabled, cache_timeout, cache_base_url)
+                    VALUES (1, ?, ?, ?)
+                """, (enabled if enabled is not None else False, timeout if timeout is not None else 600, new_base_url))
+            elif self.db_type == "mysql":
+                # MySQL uses COALESCE and IFNULL for atomic update
+                await db.execute("""
+                    UPDATE cache_config
+                    SET cache_enabled = COALESCE(?, cache_enabled),
+                        cache_timeout = COALESCE(?, cache_timeout),
+                        cache_base_url = IF(? IS NOT NULL, ?, cache_base_url),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = 1
+                """, (enabled, timeout, base_url, new_base_url))
+            else:
+                # SQLite uses COALESCE for atomic update
+                await db.execute("""
+                    UPDATE cache_config
+                    SET cache_enabled = COALESCE(?, cache_enabled),
+                        cache_timeout = COALESCE(?, cache_timeout),
+                        cache_base_url = CASE WHEN ? IS NOT NULL THEN ? ELSE cache_base_url END,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = 1
+                """, (enabled, timeout, base_url, new_base_url))
             await db.commit()
 
     # Generation config operations
     async def get_generation_config(self) -> GenerationConfig:
         """Get generation configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM generation_config WHERE id = 1")
             row = await cursor.fetchone()
@@ -1067,33 +1894,34 @@ class Database:
             return GenerationConfig(image_timeout=300, video_timeout=3000)
 
     async def update_generation_config(self, image_timeout: int = None, video_timeout: int = None):
-        """Update generation configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
-            # Get current config first
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM generation_config WHERE id = 1")
-            row = await cursor.fetchone()
+        """Update generation configuration - uses atomic COALESCE to avoid read-then-write"""
+        async with self._connect() as db:
+            # First check if row exists
+            cursor = await db.execute("SELECT COUNT(*) FROM generation_config WHERE id = 1")
+            count = await cursor.fetchone()
+            row_exists = self._get_count_value(count) > 0
 
-            if row:
-                current = dict(row)
-                # Update only provided fields
-                new_image_timeout = image_timeout if image_timeout is not None else current.get("image_timeout", 300)
-                new_video_timeout = video_timeout if video_timeout is not None else current.get("video_timeout", 3000)
+            if not row_exists:
+                # Insert if not exists
+                await db.execute("""
+                    INSERT INTO generation_config (id, image_timeout, video_timeout)
+                    VALUES (1, ?, ?)
+                """, (image_timeout if image_timeout is not None else 300, video_timeout if video_timeout is not None else 1500))
             else:
-                new_image_timeout = image_timeout if image_timeout is not None else 300
-                new_video_timeout = video_timeout if video_timeout is not None else 3000
-
-            await db.execute("""
-                UPDATE generation_config
-                SET image_timeout = ?, video_timeout = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = 1
-            """, (new_image_timeout, new_video_timeout))
+                # Use COALESCE for atomic update - only update fields that are provided
+                await db.execute("""
+                    UPDATE generation_config
+                    SET image_timeout = COALESCE(?, image_timeout),
+                        video_timeout = COALESCE(?, video_timeout),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = 1
+                """, (image_timeout, video_timeout))
             await db.commit()
 
     # Token refresh config operations
     async def get_token_refresh_config(self) -> TokenRefreshConfig:
         """Get token refresh configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM token_refresh_config WHERE id = 1")
             row = await cursor.fetchone()
@@ -1105,11 +1933,426 @@ class Database:
 
     async def update_token_refresh_config(self, at_auto_refresh_enabled: bool):
         """Update token refresh configuration"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                UPDATE token_refresh_config
-                SET at_auto_refresh_enabled = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = 1
-            """, (at_auto_refresh_enabled,))
+        async with self._connect() as db:
+            # First check if row exists
+            cursor = await db.execute("SELECT COUNT(*) FROM token_refresh_config WHERE id = 1")
+            count = await cursor.fetchone()
+            row_exists = self._get_count_value(count) > 0
+
+            if not row_exists:
+                # Insert if not exists
+                await db.execute("""
+                    INSERT INTO token_refresh_config (id, at_auto_refresh_enabled)
+                    VALUES (1, ?)
+                """, (at_auto_refresh_enabled,))
+            else:
+                await db.execute("""
+                    UPDATE token_refresh_config
+                    SET at_auto_refresh_enabled = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = 1
+                """, (at_auto_refresh_enabled,))
             await db.commit()
 
+    # Cloudflare Solver config operations
+    async def get_cloudflare_solver_config(self) -> CloudflareSolverConfig:
+        """Get Cloudflare Solver configuration"""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM cloudflare_solver_config WHERE id = 1")
+            row = await cursor.fetchone()
+            if row:
+                return CloudflareSolverConfig(**dict(row))
+            # If no row exists, return a default config
+            return CloudflareSolverConfig(solver_enabled=False, solver_api_url="http://localhost:8000/v1/challenge")
+
+    async def update_cloudflare_solver_config(self, solver_enabled: bool, solver_api_url: str = None):
+        """Update Cloudflare Solver configuration"""
+        async with self._connect() as db:
+            # First check if row exists
+            cursor = await db.execute("SELECT COUNT(*) FROM cloudflare_solver_config WHERE id = 1")
+            count = await cursor.fetchone()
+            row_exists = self._get_count_value(count) > 0
+
+            if not row_exists:
+                # Insert if not exists
+                await db.execute("""
+                    INSERT INTO cloudflare_solver_config (id, solver_enabled, solver_api_url)
+                    VALUES (1, ?, ?)
+                """, (solver_enabled, solver_api_url or "http://localhost:8000/v1/challenge"))
+            elif solver_api_url is not None:
+                await db.execute("""
+                    UPDATE cloudflare_solver_config
+                    SET solver_enabled = ?, solver_api_url = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = 1
+                """, (solver_enabled, solver_api_url))
+            else:
+                await db.execute("""
+                    UPDATE cloudflare_solver_config
+                    SET solver_enabled = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = 1
+                """, (solver_enabled,))
+            await db.commit()
+
+    async def ensure_cloudflare_solver_config_row(self, config_dict: dict = None):
+        """Ensure cloudflare_solver_config table has a row"""
+        async with self._connect() as db:
+            cursor = await db.execute("SELECT COUNT(*) FROM cloudflare_solver_config")
+            count = await cursor.fetchone()
+            if self._get_count_value(count) == 0:
+                solver_enabled = False
+                solver_api_url = "http://localhost:8000/v1/challenge"
+                if config_dict:
+                    cloudflare_config = config_dict.get("cloudflare", {})
+                    solver_enabled = cloudflare_config.get("solver_enabled", False)
+                    solver_api_url = cloudflare_config.get("solver_api_url", solver_api_url)
+                await db.execute("""
+                    INSERT INTO cloudflare_solver_config (id, solver_enabled, solver_api_url)
+                    VALUES (1, ?, ?)
+                """, (solver_enabled, solver_api_url))
+                await db.commit()
+
+    # Character (角色�? operations
+    async def create_character(self, character: Character) -> int:
+        """Create a new character record"""
+        async with self._connect() as db:
+            cursor = await db.execute("""
+                INSERT INTO characters (cameo_id, character_id, token_id, username, display_name, 
+                                       profile_url, instruction_set, safety_instruction_set, 
+                                       visibility, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (character.cameo_id, character.character_id, character.token_id,
+                  character.username, character.display_name, character.profile_url,
+                  character.instruction_set, character.safety_instruction_set,
+                  character.visibility, character.status))
+            await db.commit()
+            return cursor.lastrowid
+
+    async def get_character_by_cameo_id(self, cameo_id: str) -> Optional[Character]:
+        """Get character by cameo_id"""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM characters WHERE cameo_id = ?", (cameo_id,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                return Character(**dict(row))
+            return None
+
+    async def get_character_by_id(self, character_db_id: int) -> Optional[Character]:
+        """Get character by database id"""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM characters WHERE id = ?", (character_db_id,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                return Character(**dict(row))
+            return None
+
+    async def get_characters_by_token_id(self, token_id: int) -> List[Character]:
+        """Get all characters for a specific token"""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM characters WHERE token_id = ? ORDER BY created_at DESC", (token_id,)
+            )
+            rows = await cursor.fetchall()
+            return [Character(**dict(row)) for row in rows]
+
+    async def get_all_characters(self) -> List[Character]:
+        """Get all characters"""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM characters ORDER BY created_at DESC"
+            )
+            rows = await cursor.fetchall()
+            return [Character(**dict(row)) for row in rows]
+
+    async def update_character(self, cameo_id: str, **kwargs) -> bool:
+        """Update character fields by cameo_id"""
+        if not kwargs:
+            return False
+
+        # Build dynamic update query
+        set_clauses = []
+        values = []
+        for key, value in kwargs.items():
+            if key in ['character_id', 'username', 'display_name', 'profile_url',
+                       'instruction_set', 'safety_instruction_set', 'visibility', 'status']:
+                set_clauses.append(f"{key} = ?")
+                values.append(value)
+
+        if not set_clauses:
+            return False
+
+        set_clauses.append("updated_at = CURRENT_TIMESTAMP")
+        values.append(cameo_id)
+
+        async with self._connect() as db:
+            await db.execute(
+                f"UPDATE characters SET {', '.join(set_clauses)} WHERE cameo_id = ?",
+                values
+            )
+            await db.commit()
+            return True
+
+    async def delete_character(self, cameo_id: str) -> bool:
+        """Delete character by cameo_id"""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "DELETE FROM characters WHERE cameo_id = ?", (cameo_id,)
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+
+    # WebDAV config operations
+    async def ensure_webdav_config_row(self):
+        """Ensure webdav_config table has a row"""
+        async with self._connect() as db:
+            cursor = await db.execute("SELECT COUNT(*) FROM webdav_config WHERE id = 1")
+            count = await cursor.fetchone()
+            if self._get_count_value(count) == 0:
+                await db.execute("""
+                    INSERT INTO webdav_config (id, webdav_enabled, webdav_upload_path, auto_delete_enabled, auto_delete_days)
+                    VALUES (1, 0, '/video', 0, 30)
+                """)
+                await db.commit()
+
+    async def get_webdav_config(self) -> WebDAVConfig:
+        """Get WebDAV configuration"""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM webdav_config WHERE id = 1")
+            row = await cursor.fetchone()
+            if row:
+                return WebDAVConfig(**dict(row))
+            # If no row exists, return a default config
+            return WebDAVConfig(webdav_enabled=False)
+
+    async def update_webdav_config(self, enabled: bool = None, url: str = None,
+                                   username: str = None, password: str = None,
+                                   upload_path: str = None, auto_delete_enabled: bool = None,
+                                   auto_delete_days: int = None):
+        """Update WebDAV configuration"""
+        async with self._connect() as db:
+            # Check if row exists
+            cursor = await db.execute("SELECT COUNT(*) FROM webdav_config WHERE id = 1")
+            count = await cursor.fetchone()
+
+            if self._get_count_value(count) == 0:
+                # Insert new row
+                await db.execute("""
+                    INSERT INTO webdav_config (id, webdav_enabled, webdav_url, webdav_username, 
+                                              webdav_password, webdav_upload_path, auto_delete_enabled, auto_delete_days)
+                    VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                """, (enabled or False, url, username, password, upload_path or '/video',
+                      auto_delete_enabled or False, auto_delete_days or 30))
+            else:
+                # Build dynamic update query
+                updates = []
+                params = []
+
+                if enabled is not None:
+                    updates.append("webdav_enabled = ?")
+                    params.append(enabled)
+                if url is not None:
+                    updates.append("webdav_url = ?")
+                    params.append(url)
+                if username is not None:
+                    updates.append("webdav_username = ?")
+                    params.append(username)
+                if password is not None:
+                    updates.append("webdav_password = ?")
+                    params.append(password)
+                if upload_path is not None:
+                    updates.append("webdav_upload_path = ?")
+                    params.append(upload_path)
+                if auto_delete_enabled is not None:
+                    updates.append("auto_delete_enabled = ?")
+                    params.append(auto_delete_enabled)
+                if auto_delete_days is not None:
+                    updates.append("auto_delete_days = ?")
+                    params.append(auto_delete_days)
+
+                if updates:
+                    updates.append("updated_at = CURRENT_TIMESTAMP")
+                    query = f"UPDATE webdav_config SET {', '.join(updates)} WHERE id = 1"
+                    await db.execute(query, params)
+
+            await db.commit()
+
+    # Video record operations
+    async def create_video_record(self, record: VideoRecord) -> int:
+        """Create a new video record"""
+        async with self._connect() as db:
+            cursor = await db.execute("""
+                INSERT INTO video_records (task_id, token_id, original_url, watermark_free_url, 
+                                          webdav_path, webdav_url, file_size, status, error_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (record.task_id, record.token_id, record.original_url, record.watermark_free_url,
+                  record.webdav_path, record.webdav_url, record.file_size, record.status, record.error_message))
+            await db.commit()
+            return cursor.lastrowid
+
+    async def get_video_record(self, record_id: int) -> Optional[VideoRecord]:
+        """Get video record by ID"""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM video_records WHERE id = ?", (record_id,))
+            row = await cursor.fetchone()
+            if row:
+                return VideoRecord(**dict(row))
+            return None
+
+    async def get_video_record_by_task_id(self, task_id: str) -> Optional[VideoRecord]:
+        """Get video record by task ID"""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM video_records WHERE task_id = ?", (task_id,))
+            row = await cursor.fetchone()
+            if row:
+                return VideoRecord(**dict(row))
+            return None
+
+    async def get_all_video_records(self, limit: int = 100, status: str = None) -> List[VideoRecord]:
+        """Get all video records with optional status filter"""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            if status:
+                cursor = await db.execute(
+                    "SELECT * FROM video_records WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                    (status, limit)
+                )
+            else:
+                cursor = await db.execute(
+                    "SELECT * FROM video_records ORDER BY created_at DESC LIMIT ?",
+                    (limit,)
+                )
+            rows = await cursor.fetchall()
+            return [VideoRecord(**dict(row)) for row in rows]
+
+    async def get_video_records_for_auto_delete(self, days: int) -> List[VideoRecord]:
+        """Get video records older than specified days for auto deletion"""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            # Use database-specific date arithmetic
+            if self.db_type == "mysql":
+                cursor = await db.execute("""
+                    SELECT * FROM video_records 
+                    WHERE status = 'uploaded' 
+                    AND uploaded_at < DATE_SUB(NOW(), INTERVAL ? DAY)
+                """, (days,))
+            else:
+                cursor = await db.execute("""
+                    SELECT * FROM video_records 
+                    WHERE status = 'uploaded' 
+                    AND uploaded_at < datetime('now', ? || ' days')
+                """, (f"-{days}",))
+            rows = await cursor.fetchall()
+            return [VideoRecord(**dict(row)) for row in rows]
+
+    async def update_video_record(self, record_id: int, **kwargs):
+        """Update video record fields"""
+        if not kwargs:
+            return
+
+        async with self._connect() as db:
+            updates = []
+            params = []
+
+            for key, value in kwargs.items():
+                if key in ['watermark_free_url', 'webdav_path', 'webdav_url', 'file_size',
+                          'status', 'error_message', 'uploaded_at', 'deleted_at']:
+                    updates.append(f"{key} = ?")
+                    params.append(value)
+
+            if updates:
+                params.append(record_id)
+                query = f"UPDATE video_records SET {', '.join(updates)} WHERE id = ?"
+                await db.execute(query, params)
+                await db.commit()
+
+    async def delete_video_record(self, record_id: int):
+        """Delete video record"""
+        async with self._connect() as db:
+            await db.execute("DELETE FROM upload_logs WHERE video_record_id = ?", (record_id,))
+            await db.execute("DELETE FROM video_records WHERE id = ?", (record_id,))
+            await db.commit()
+
+    async def delete_all_video_records(self):
+        """Delete all video records and upload logs"""
+        async with self._connect() as db:
+            await db.execute("DELETE FROM upload_logs")
+            await db.execute("DELETE FROM video_records")
+            await db.commit()
+
+    async def get_video_records_stats(self) -> dict:
+        """Get video records statistics"""
+        async with self._connect() as db:
+            cursor = await db.execute("""
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(CASE WHEN status = 'uploaded' THEN 1 ELSE 0 END) as uploaded,
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+                    SUM(CASE WHEN status = 'deleted' THEN 1 ELSE 0 END) as deleted,
+                    SUM(COALESCE(file_size, 0)) as total_size
+                FROM video_records
+            """)
+            row = await cursor.fetchone()
+            if isinstance(row, dict):
+                return {
+                    "total": row.get("total") or 0,
+                    "uploaded": row.get("uploaded") or 0,
+                    "pending": row.get("pending") or 0,
+                    "failed": row.get("failed") or 0,
+                    "deleted": row.get("deleted") or 0,
+                    "total_size": row.get("total_size") or 0
+                }
+            else:
+                return {
+                    "total": row[0] or 0,
+                    "uploaded": row[1] or 0,
+                    "pending": row[2] or 0,
+                    "failed": row[3] or 0,
+                    "deleted": row[4] or 0,
+                    "total_size": row[5] or 0
+                }
+
+    # Upload log operations
+    async def create_upload_log(self, log: UploadLog) -> int:
+        """Create a new upload log"""
+        async with self._connect() as db:
+            cursor = await db.execute("""
+                INSERT INTO upload_logs (video_record_id, operation, status, message, duration)
+                VALUES (?, ?, ?, ?, ?)
+            """, (log.video_record_id, log.operation, log.status, log.message, log.duration))
+            await db.commit()
+            return cursor.lastrowid
+
+    async def get_upload_logs(self, limit: int = 100) -> List[dict]:
+        """Get recent upload logs with video record info"""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT 
+                    ul.*,
+                    vr.task_id,
+                    vr.webdav_path
+                FROM upload_logs ul
+                LEFT JOIN video_records vr ON ul.video_record_id = vr.id
+                ORDER BY ul.created_at DESC
+                LIMIT ?
+            """, (limit,))
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def delete_all_upload_logs(self):
+        """Delete all upload logs"""
+        async with self._connect() as db:
+            await db.execute("DELETE FROM upload_logs")
+            await db.commit()

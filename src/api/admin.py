@@ -21,8 +21,58 @@ db: Database = None
 generation_handler = None
 concurrency_manager: ConcurrencyManager = None
 
-# Store active admin tokens (in production, use Redis or database)
-active_admin_tokens = set()
+# Admin token storage with expiration
+# Format: {token: expiry_timestamp}
+_admin_tokens: dict = {}
+_admin_tokens_lock = None  # Will be initialized on first use
+ADMIN_TOKEN_TTL_SECONDS = 24 * 60 * 60  # 24 hours
+
+
+def _get_admin_tokens_lock():
+    """Get or create the admin tokens lock (lazy initialization for async context)"""
+    global _admin_tokens_lock
+    if _admin_tokens_lock is None:
+        import asyncio
+        _admin_tokens_lock = asyncio.Lock()
+    return _admin_tokens_lock
+
+
+def _cleanup_expired_tokens():
+    """Remove expired tokens from storage (non-async version for sync contexts)"""
+    import time
+    current_time = time.time()
+    expired = [token for token, expiry in _admin_tokens.items() if expiry < current_time]
+    for token in expired:
+        _admin_tokens.pop(token, None)
+
+
+def _add_admin_token(token: str):
+    """Add a new admin token with expiration"""
+    import time
+    _cleanup_expired_tokens()
+    _admin_tokens[token] = time.time() + ADMIN_TOKEN_TTL_SECONDS
+
+
+def _remove_admin_token(token: str):
+    """Remove an admin token"""
+    _admin_tokens.pop(token, None)
+
+
+def _is_valid_admin_token(token: str) -> bool:
+    """Check if an admin token is valid and not expired"""
+    import time
+    if token not in _admin_tokens:
+        return False
+    if _admin_tokens[token] < time.time():
+        _admin_tokens.pop(token, None)
+        return False
+    return True
+
+
+def _invalidate_all_admin_tokens():
+    """Invalidate all admin tokens (used when password changes)"""
+    _admin_tokens.clear()
+
 
 def set_dependencies(tm: TokenManager, pm: ProxyManager, database: Database, gh=None, cm: ConcurrencyManager = None):
     """Set dependencies"""
@@ -32,6 +82,7 @@ def set_dependencies(tm: TokenManager, pm: ProxyManager, database: Database, gh=
     db = database
     generation_handler = gh
     concurrency_manager = cm
+
 
 def verify_admin_token(authorization: str = Header(None)):
     """Verify admin token from Authorization header"""
@@ -43,7 +94,7 @@ def verify_admin_token(authorization: str = Header(None)):
     if authorization.startswith("Bearer "):
         token = authorization[7:]
 
-    if token not in active_admin_tokens:
+    if not _is_valid_admin_token(token):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
     return token
@@ -97,8 +148,8 @@ class ImportTokenItem(BaseModel):
     access_token: str  # Access Token (AT)
     session_token: Optional[str] = None  # Session Token (ST)
     refresh_token: Optional[str] = None  # Refresh Token (RT)
-    proxy_url: Optional[str] = None  # Proxy URL (optional, for compatibility)
-    remark: Optional[str] = None  # Remark (optional, for compatibility)
+    proxy_url: Optional[str] = None  # Proxy URL (optional)
+    remark: Optional[str] = None  # Remark (optional)
     is_active: bool = True  # Active status
     image_enabled: bool = True  # Enable image generation
     video_enabled: bool = True  # Enable video generation
@@ -108,12 +159,31 @@ class ImportTokenItem(BaseModel):
 class ImportTokensRequest(BaseModel):
     tokens: List[ImportTokenItem]
 
+# Batch Add Token models
+class BatchAddTokenItem(BaseModel):
+    """Single token item for batch add operation"""
+    token: str  # Access Token (AT) - required
+    st: Optional[str] = None  # Session Token (ST)
+    rt: Optional[str] = None  # Refresh Token (RT)
+    client_id: Optional[str] = None  # Client ID
+    proxy_url: Optional[str] = None  # Proxy URL
+    remark: Optional[str] = None  # Remark
+    image_enabled: bool = True  # Enable image generation
+    video_enabled: bool = True  # Enable video generation
+    image_concurrency: int = -1  # Image concurrency limit
+    video_concurrency: int = -1  # Video concurrency limit
+
+class BatchAddTokensRequest(BaseModel):
+    """Request model for batch adding tokens"""
+    tokens: List[BatchAddTokenItem]
+
 class UpdateAdminConfigRequest(BaseModel):
     error_ban_threshold: int
 
 class UpdateProxyConfigRequest(BaseModel):
     proxy_enabled: bool
     proxy_url: Optional[str] = None
+    proxy_pool_enabled: bool = False
 
 class UpdateAdminPasswordRequest(BaseModel):
     old_password: str
@@ -142,6 +212,10 @@ class UpdateWatermarkFreeConfigRequest(BaseModel):
     custom_parse_url: Optional[str] = None
     custom_parse_token: Optional[str] = None
 
+class UpdateCloudflareSolverConfigRequest(BaseModel):
+    solver_enabled: bool
+    solver_api_url: Optional[str] = None
+
 # Auth endpoints
 @router.post("/api/login", response_model=LoginResponse)
 async def login(request: LoginRequest):
@@ -149,8 +223,8 @@ async def login(request: LoginRequest):
     if AuthManager.verify_admin(request.username, request.password):
         # Generate simple token
         token = f"admin-{secrets.token_urlsafe(32)}"
-        # Store token in active tokens
-        active_admin_tokens.add(token)
+        # Store token with expiration
+        _add_admin_token(token)
         return LoginResponse(success=True, token=token, message="Login successful")
     else:
         return LoginResponse(success=False, message="Invalid credentials")
@@ -158,8 +232,8 @@ async def login(request: LoginRequest):
 @router.post("/api/logout")
 async def logout(token: str = Depends(verify_admin_token)):
     """Admin logout"""
-    # Remove token from active tokens
-    active_admin_tokens.discard(token)
+    # Remove token from storage
+    _remove_admin_token(token)
     return {"success": True, "message": "Logged out successfully"}
 
 # Token management endpoints
@@ -167,10 +241,14 @@ async def logout(token: str = Depends(verify_admin_token)):
 async def get_tokens(token: str = Depends(verify_admin_token)) -> List[dict]:
     """Get all tokens with statistics"""
     tokens = await token_manager.get_all_tokens()
+
+    # Batch fetch all token stats in a single query (N+1 optimization)
+    all_stats = await db.get_all_token_stats()
+
     result = []
 
     for token in tokens:
-        stats = await db.get_token_stats(token.id)
+        stats = all_stats.get(token.id)
         result.append({
             "id": token.id,
             "token": token.token,  # 完整的Access Token
@@ -335,6 +413,27 @@ async def test_token(token_id: int, token: str = Depends(verify_admin_token)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@router.delete("/api/tokens/batch-delete-disabled")
+async def batch_delete_disabled_tokens(token: str = Depends(verify_admin_token)):
+    """Delete all disabled tokens"""
+    try:
+        all_tokens = await db.get_all_tokens()
+        deleted_count = 0
+
+        for t in all_tokens:
+            if not t.is_active:
+                await token_manager.delete_token(t.id)
+                deleted_count += 1
+
+        return {
+            "success": True,
+            "message": f"已删除 {deleted_count} 个禁用账号",
+            "deleted_count": deleted_count
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"批量删除失败: {str(e)}")
+
+
 @router.delete("/api/tokens/{token_id}")
 async def delete_token(token_id: int, token: str = Depends(verify_admin_token)):
     """Delete a token"""
@@ -343,6 +442,153 @@ async def delete_token(token_id: int, token: str = Depends(verify_admin_token)):
         return {"success": True, "message": "Token deleted"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@router.post("/api/tokens/batch-add")
+async def batch_add_tokens(
+    request: BatchAddTokensRequest,
+    token: str = Depends(verify_admin_token)
+):
+    """Batch add multiple tokens
+
+    Adds multiple tokens at once with duplicate detection.
+    - Skips tokens that already exist (by email)
+    - Skips duplicate tokens within the same batch
+    - Continues processing remaining tokens if one fails
+
+    **Validates: Requirements 2.1, 2.2, 2.3, 2.4**
+    """
+    try:
+        # Convert Pydantic models to dicts for the token manager
+        tokens_data = [item.model_dump() for item in request.tokens]
+
+        result = await token_manager.batch_add_tokens(tokens_data)
+
+        # Initialize concurrency counters for newly added tokens
+        if concurrency_manager:
+            for detail in result.get("details", []):
+                if detail.get("status") == "added" and detail.get("token_id"):
+                    token_item = next(
+                        (t for t in request.tokens if t.token[:20] == detail.get("token", "")[:20]),
+                        None
+                    )
+                    if token_item:
+                        await concurrency_manager.reset_token(
+                            detail["token_id"],
+                            image_concurrency=token_item.image_concurrency,
+                            video_concurrency=token_item.video_concurrency
+                        )
+
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"批量添加失败: {str(e)}")
+
+@router.post("/api/tokens/batch-test")
+async def batch_test_tokens(
+    only_active: bool = True,
+    only_disabled: bool = False,
+    token: str = Depends(verify_admin_token)
+):
+    """Batch test all tokens
+
+    - only_active=True: Test only active tokens, auto-disable 401 tokens
+    - only_disabled=True: Test only disabled tokens, auto-enable valid tokens
+    - Both False: Test all tokens
+    """
+    try:
+        result = await token_manager.batch_test_tokens(
+            only_active=only_active,
+            only_disabled=only_disabled
+        )
+        return {
+            "success": True,
+            "message": f"测试完成: {result['valid']} 有效, {result['invalid']} 无效, "
+                      f"{result['auto_disabled']} 已自动禁用, {result['auto_enabled']} 已自动启用",
+            **result
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"批量测试失败: {str(e)}")
+
+
+class BatchActivateRequest(BaseModel):
+    """Request model for batch activating Sora2"""
+    invite_code: str
+
+
+@router.post("/api/tokens/batch-activate")
+async def batch_activate_sora2(
+    request: BatchActivateRequest,
+    token: str = Depends(verify_admin_token)
+):
+    """Batch activate Sora2 for tokens without Sora2 support
+
+    Activates Sora2 for all active tokens that don't have Sora2 support.
+    - Filters tokens where sora2_supported is False or None
+    - Uses concurrency control (max 3 concurrent activations)
+    - Returns summary with activated/already-active/failed counts
+
+    **Validates: Requirements 3.1, 3.2, 3.3, 3.4**
+    """
+    try:
+        if not request.invite_code or len(request.invite_code) != 6:
+            raise HTTPException(status_code=400, detail="邀请码必须是6位")
+
+        result = await token_manager.batch_activate_sora2(
+            invite_code=request.invite_code,
+            max_concurrency=3
+        )
+
+        return {
+            "success": True,
+            "message": f"批量激活完成: {result['activated']} 激活, {result['already_active']} 已激活, {result['failed']} 失败",
+            **result
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"批量激活失败: {str(e)}")
+
+
+@router.post("/api/tokens/batch-enable")
+async def batch_enable_tokens(token: str = Depends(verify_admin_token)):
+    """Enable all disabled tokens"""
+    try:
+        all_tokens = await db.get_all_tokens()
+        enabled_count = 0
+
+        for t in all_tokens:
+            if not t.is_active:
+                await token_manager.enable_token(t.id)
+                enabled_count += 1
+
+        return {
+            "success": True,
+            "message": f"已启用 {enabled_count} 个账号",
+            "enabled_count": enabled_count
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"批量启用失败: {str(e)}")
+
+
+@router.post("/api/tokens/batch-disable")
+async def batch_disable_tokens(token: str = Depends(verify_admin_token)):
+    """Disable all enabled tokens"""
+    try:
+        all_tokens = await db.get_all_tokens()
+        disabled_count = 0
+
+        for t in all_tokens:
+            if t.is_active:
+                await token_manager.disable_token(t.id)
+                disabled_count += 1
+
+        return {
+            "success": True,
+            "message": f"已禁用 {disabled_count} 个账号",
+            "disabled_count": disabled_count
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"批量禁用失败: {str(e)}")
+
 
 @router.post("/api/tokens/import")
 async def import_tokens(request: ImportTokensRequest, token: str = Depends(verify_admin_token)):
@@ -526,7 +772,7 @@ async def update_admin_password(
             config.set_admin_username_from_db(request.username)
 
         # Invalidate all admin tokens (force re-login)
-        active_admin_tokens.clear()
+        _invalidate_all_admin_tokens()
 
         return {"success": True, "message": "Password updated successfully. Please login again."}
     except HTTPException:
@@ -574,10 +820,13 @@ async def update_debug_config(
 @router.get("/api/proxy/config")
 async def get_proxy_config(token: str = Depends(verify_admin_token)) -> dict:
     """Get proxy configuration"""
-    config = await proxy_manager.get_proxy_config()
+    proxy_config = await proxy_manager.get_proxy_config()
+    pool_count = await proxy_manager.get_proxy_pool_count()
     return {
-        "proxy_enabled": config.proxy_enabled,
-        "proxy_url": config.proxy_url
+        "proxy_enabled": proxy_config.proxy_enabled,
+        "proxy_url": proxy_config.proxy_url,
+        "proxy_pool_enabled": proxy_config.proxy_pool_enabled,
+        "proxy_pool_count": pool_count
     }
 
 @router.post("/api/proxy/config")
@@ -587,7 +836,11 @@ async def update_proxy_config(
 ):
     """Update proxy configuration"""
     try:
-        await proxy_manager.update_proxy_config(request.proxy_enabled, request.proxy_url)
+        await proxy_manager.update_proxy_config(
+            request.proxy_enabled,
+            request.proxy_url,
+            request.proxy_pool_enabled
+        )
         return {"success": True, "message": "Proxy configuration updated"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -626,6 +879,127 @@ async def update_watermark_free_config(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+# Cloudflare Solver config endpoints
+@router.get("/api/cloudflare/config")
+async def get_cloudflare_solver_config(token: str = Depends(verify_admin_token)) -> dict:
+    """Get Cloudflare Solver configuration"""
+    # Ensure table has a row
+    await db.ensure_cloudflare_solver_config_row()
+    config_obj = await db.get_cloudflare_solver_config()
+    return {
+        "success": True,
+        "config": {
+            "solver_enabled": config_obj.solver_enabled,
+            "solver_api_url": config_obj.solver_api_url
+        }
+    }
+
+@router.post("/api/cloudflare/config")
+async def update_cloudflare_solver_config(
+    request: UpdateCloudflareSolverConfigRequest,
+    token: str = Depends(verify_admin_token)
+):
+    """Update Cloudflare Solver configuration"""
+    try:
+        from ..core.config import config
+
+        # Ensure table has a row
+        await db.ensure_cloudflare_solver_config_row()
+
+        # Update database
+        await db.update_cloudflare_solver_config(
+            request.solver_enabled,
+            request.solver_api_url
+        )
+
+        # Also update in-memory config for immediate effect
+        config.set_cf_enabled(request.solver_enabled)
+        if request.solver_api_url:
+            config.set_cf_api_url(request.solver_api_url)
+
+        return {"success": True, "message": "Cloudflare Solver configuration updated"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# Cloudflare State endpoints
+@router.get("/api/cloudflare/state")
+async def get_cloudflare_state(token: str = Depends(verify_admin_token)) -> dict:
+    """Get current Cloudflare credentials state"""
+    from ..services.cloudflare_solver import get_cloudflare_state
+    cf_state = get_cloudflare_state()
+    return {
+        "success": True,
+        "state": cf_state.get_status()
+    }
+
+@router.post("/api/cloudflare/refresh")
+async def refresh_cloudflare_credentials(token: str = Depends(verify_admin_token)) -> dict:
+    """Manually refresh Cloudflare credentials"""
+    import sys
+    print("🔄 [API] 收到获取凭据请求", flush=True)
+    sys.stdout.flush()
+
+    from ..services.cloudflare_solver import solve_cloudflare_challenge, get_cloudflare_state
+    from ..core.config import config
+
+    print(f"🔄 [API] Solver启用: {config.cf_enabled}, URL: {config.cf_api_url}", flush=True)
+    sys.stdout.flush()
+
+    # 检查是否启用了 Cloudflare Solver
+    if not config.cf_enabled:
+        print("⚠️ [API] Solver未启用", flush=True)
+        raise HTTPException(status_code=400, detail="Cloudflare Solver 未启用，请先在配置中启用")
+
+    if not config.cf_api_url:
+        print("⚠️ [API] Solver URL未配置", flush=True)
+        raise HTTPException(status_code=400, detail="Cloudflare Solver API 地址未配置")
+
+    try:
+        print("🔄 [API] 开始调用 solve_cloudflare_challenge", flush=True)
+        sys.stdout.flush()
+        result = await solve_cloudflare_challenge(force_refresh=True)
+        print(f"🔄 [API] solve_cloudflare_challenge 返回: {result is not None}", flush=True)
+        sys.stdout.flush()
+        if result:
+            print("🔄 [API] 获取 cf_state", flush=True)
+            sys.stdout.flush()
+            cf_state = get_cloudflare_state()
+            print("🔄 [API] 调用 get_status()", flush=True)
+            sys.stdout.flush()
+            status = cf_state.get_status()
+            print(f"🔄 [API] get_status() 返回: {status}", flush=True)
+            sys.stdout.flush()
+            response = {
+                "success": True,
+                "message": "Cloudflare credentials refreshed successfully",
+                "state": status
+            }
+            print(f"🔄 [API] 准备返回响应", flush=True)
+            sys.stdout.flush()
+            return response
+        else:
+            raise HTTPException(status_code=500, detail="CF 凭据获取失败，请检查 Solver 服务")
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"❌ [API] 异常: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        sys.stdout.flush()
+        raise HTTPException(status_code=500, detail=f"获取凭据失败: {str(e)}")
+
+@router.post("/api/cloudflare/clear")
+async def clear_cloudflare_credentials(token: str = Depends(verify_admin_token)) -> dict:
+    """Clear Cloudflare credentials"""
+    from ..services.cloudflare_solver import get_cloudflare_state
+    cf_state = get_cloudflare_state()
+    cf_state.clear()
+    return {
+        "success": True,
+        "message": "Cloudflare credentials cleared",
+        "state": cf_state.get_status()
+    }
+
 # Statistics endpoints
 @router.get("/api/stats")
 async def get_stats(token: str = Depends(verify_admin_token)):
@@ -633,33 +1007,154 @@ async def get_stats(token: str = Depends(verify_admin_token)):
     tokens = await token_manager.get_all_tokens()
     active_tokens = await token_manager.get_active_tokens()
 
-    total_images = 0
-    total_videos = 0
-    total_errors = 0
-    today_images = 0
-    today_videos = 0
-    today_errors = 0
-
-    for token in tokens:
-        stats = await db.get_token_stats(token.id)
-        if stats:
-            total_images += stats.image_count
-            total_videos += stats.video_count
-            total_errors += stats.error_count
-            today_images += stats.today_image_count
-            today_videos += stats.today_video_count
-            today_errors += stats.today_error_count
+    # Backfill missing stats rows for legacy/imported tokens
+    await db.ensure_token_stats_rows()
+    await db.cleanup_stale_tasks()
+    stats = await db.get_stats()
 
     return {
         "total_tokens": len(tokens),
         "active_tokens": len(active_tokens),
-        "total_images": total_images,
-        "total_videos": total_videos,
-        "today_images": today_images,
-        "today_videos": today_videos,
-        "total_errors": total_errors,
-        "today_errors": today_errors
+        "total_images": stats.get("total_images", 0),
+        "total_videos": stats.get("total_videos", 0),
+        "today_images": stats.get("today_images", 0),
+        "today_videos": stats.get("today_videos", 0),
+        "total_errors": stats.get("total_errors", 0),
+        "today_errors": stats.get("today_errors", 0)
     }
+
+# Username activation endpoint
+@router.post("/api/tokens/{token_id}/activate-username")
+async def activate_username(
+    token_id: int,
+    token: str = Depends(verify_admin_token)
+):
+    """Activate username for a token (auto-generate and set username if not set)"""
+    try:
+        # Get token
+        token_obj = await db.get_token(token_id)
+        if not token_obj:
+            raise HTTPException(status_code=404, detail="Token not found")
+
+        # Get user info to check current username
+        print(f"🔍 [activate-username] Getting user info for token {token_id}...")
+        try:
+            user_info = await token_manager.get_user_info(token_obj.token)
+        except Exception as e:
+            print(f"❌ [activate-username] Failed to get user info: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"获取用户信息失败: {str(e)}")
+
+        current_username = user_info.get("username")
+        print(f"📋 [activate-username] Current username: {current_username}")
+
+        if current_username:
+            return {
+                "success": True,
+                "message": f"用户名已存在: {current_username}",
+                "username": current_username,
+                "already_set": True
+            }
+
+        # Generate and set random username
+        print(f"🔄 [activate-username] Username is null, generating random username...")
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            generated_username = token_manager._generate_random_username()
+            print(f"🔄 [activate-username] Attempt {attempt + 1}/{max_attempts}: trying username '{generated_username}'")
+
+            # Check if username is available
+            try:
+                is_available = await token_manager.check_username_available(token_obj.token, generated_username)
+            except Exception as e:
+                print(f"❌ [activate-username] Failed to check username availability: {str(e)}")
+                if attempt == max_attempts - 1:
+                    raise HTTPException(status_code=500, detail=f"检查用户名可用性失败: {str(e)}")
+                continue
+
+            if is_available:
+                # Set the username
+                try:
+                    result = await token_manager.set_username(token_obj.token, generated_username)
+                    print(f"✅ [activate-username] Username set successfully: {generated_username}")
+                    return {
+                        "success": True,
+                        "message": f"用户名设置成功: {generated_username}",
+                        "username": generated_username,
+                        "already_set": False
+                    }
+                except Exception as e:
+                    print(f"❌ [activate-username] Failed to set username: {str(e)}")
+                    if attempt == max_attempts - 1:
+                        raise HTTPException(status_code=500, detail=f"用户名设置失败: {str(e)}")
+            else:
+                print(f"⚠️ [activate-username] Username '{generated_username}' is not available")
+
+        raise HTTPException(status_code=500, detail="无法找到可用的用户名，请稍后重试")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ [activate-username] Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"激活用户名失败: {str(e)}")
+
+
+@router.post("/api/tokens/batch-activate-username")
+async def batch_activate_username(token: str = Depends(verify_admin_token)):
+    """Batch activate usernames for all active tokens"""
+    try:
+        all_tokens = await db.get_all_tokens()
+        active_tokens = [t for t in all_tokens if t.is_active]
+
+        activated = 0
+        already_set = 0
+        failed = 0
+
+        for token_obj in active_tokens:
+            try:
+                # Get user info to check current username
+                user_info = await token_manager.get_user_info(token_obj.token)
+                current_username = user_info.get("username")
+
+                if current_username:
+                    already_set += 1
+                    continue
+
+                # Generate and set random username
+                max_attempts = 3
+                success = False
+                for attempt in range(max_attempts):
+                    generated_username = token_manager._generate_random_username()
+
+                    try:
+                        is_available = await token_manager.check_username_available(token_obj.token, generated_username)
+                        if is_available:
+                            await token_manager.set_username(token_obj.token, generated_username)
+                            activated += 1
+                            success = True
+                            print(f"✅ [batch-activate-username] Token {token_obj.id}: username set to '{generated_username}'")
+                            break
+                    except Exception as e:
+                        print(f"⚠️ [batch-activate-username] Token {token_obj.id} attempt {attempt + 1} failed: {str(e)}")
+                        continue
+
+                if not success:
+                    failed += 1
+                    print(f"❌ [batch-activate-username] Token {token_obj.id}: failed to set username")
+
+            except Exception as e:
+                failed += 1
+                print(f"❌ [batch-activate-username] Token {token_obj.id} error: {str(e)}")
+
+        return {
+            "success": True,
+            "activated": activated,
+            "already_set": already_set,
+            "failed": failed,
+            "total": len(active_tokens)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"批量激活用户名失败: {str(e)}")
+
 
 # Sora2 endpoints
 @router.post("/api/tokens/{token_id}/sora2/activate")
@@ -747,19 +1242,12 @@ async def get_logs(limit: int = 100, token: str = Depends(verify_admin_token)):
             if task:
                 log_data["progress"] = task.progress
                 log_data["task_status"] = task.status
+                if task.status == "cancelled":
+                    log_data["status_code"] = 499
 
         result.append(log_data)
 
     return result
-
-@router.delete("/api/logs")
-async def clear_logs(token: str = Depends(verify_admin_token)):
-    """Clear all logs"""
-    try:
-        await db.clear_all_logs()
-        return {"success": True, "message": "所有日志已清空"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 # Cache config endpoints
 @router.post("/api/cache/config")
@@ -963,3 +1451,242 @@ async def update_at_auto_refresh_enabled(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update AT auto refresh enabled status: {str(e)}")
+
+# Character (角色卡) management endpoints
+class CharacterUpdateRequest(BaseModel):
+    instruction_set: Optional[str] = None
+    safety_instruction_set: Optional[str] = None
+    visibility: Optional[str] = None
+
+@router.get("/api/characters")
+async def list_characters(token: str = Depends(verify_admin_token)):
+    """List all characters"""
+    try:
+        characters = await db.get_all_characters()
+        return {
+            "success": True,
+            "characters": [char.model_dump() for char in characters]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list characters: {str(e)}")
+
+@router.get("/api/characters/by-token/{token_id}")
+async def list_characters_by_token(token_id: int, token: str = Depends(verify_admin_token)):
+    """List characters for a specific token"""
+    try:
+        characters = await db.get_characters_by_token_id(token_id)
+        return {
+            "success": True,
+            "characters": [char.model_dump() for char in characters]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list characters: {str(e)}")
+
+@router.get("/api/characters/{cameo_id}")
+async def get_character(cameo_id: str, token: str = Depends(verify_admin_token)):
+    """Get character by cameo_id"""
+    try:
+        character = await db.get_character_by_cameo_id(cameo_id)
+        if not character:
+            raise HTTPException(status_code=404, detail="Character not found")
+        return {
+            "success": True,
+            "character": character.model_dump()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get character: {str(e)}")
+
+@router.post("/api/characters/{cameo_id}/update")
+async def update_character_instructions(
+    cameo_id: str,
+    request: CharacterUpdateRequest,
+    token: str = Depends(verify_admin_token)
+):
+    """Update character instruction_set and safety_instruction_set via Sora API"""
+    try:
+        # Get character from database to find associated token
+        character = await db.get_character_by_cameo_id(cameo_id)
+        if not character:
+            raise HTTPException(status_code=404, detail="Character not found in database")
+
+        # Get the token for this character
+        token_obj = await token_manager.get_token_by_id(character.token_id)
+        if not token_obj:
+            raise HTTPException(status_code=404, detail="Associated token not found")
+
+        # Call Sora API to update character
+        result = await generation_handler.sora_client.update_character_instructions(
+            cameo_id=cameo_id,
+            token=token_obj.token,
+            instruction_set=request.instruction_set,
+            safety_instruction_set=request.safety_instruction_set,
+            visibility=request.visibility
+        )
+
+        # Update local database
+        update_fields = {}
+        if request.instruction_set is not None:
+            update_fields['instruction_set'] = request.instruction_set
+        if request.safety_instruction_set is not None:
+            update_fields['safety_instruction_set'] = request.safety_instruction_set
+        if request.visibility is not None:
+            update_fields['visibility'] = request.visibility
+
+        if update_fields:
+            await db.update_character(cameo_id, **update_fields)
+
+        return {
+            "success": True,
+            "message": "Character updated successfully",
+            "result": result
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update character: {str(e)}")
+
+@router.delete("/api/characters/{cameo_id}")
+async def delete_character(cameo_id: str, token: str = Depends(verify_admin_token)):
+    """Delete character from database (does not delete from Sora)"""
+    try:
+        success = await db.delete_character(cameo_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Character not found")
+        return {
+            "success": True,
+            "message": "Character deleted from database"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete character: {str(e)}")
+
+# Token characters endpoint (get characters from Sora API)
+@router.get("/api/tokens/{token_id}/sora-characters")
+async def get_token_sora_characters(
+    token_id: int,
+    token: str = Depends(verify_admin_token)
+):
+    """Get characters from Sora API for a specific token"""
+    try:
+        # Get the token
+        token_obj = await token_manager.get_token_by_id(token_id)
+        if not token_obj:
+            raise HTTPException(status_code=404, detail="Token not found")
+
+        # Get characters from Sora API (via profile feed or dedicated endpoint if available)
+        # For now, we return local database characters
+        characters = await db.get_characters_by_token_id(token_id)
+
+        return {
+            "success": True,
+            "token_id": token_id,
+            "characters": [char.model_dump() for char in characters]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get characters: {str(e)}")
+
+
+# Proxy pool file endpoints
+@router.get("/api/proxy/pool")
+async def get_proxy_pool(token: str = Depends(verify_admin_token)):
+    """Get proxy pool content from data/proxy.txt"""
+    try:
+        import os
+        proxy_file = os.path.join("data", "proxy.txt")
+        if os.path.exists(proxy_file):
+            with open(proxy_file, "r", encoding="utf-8") as f:
+                content = f.read()
+        else:
+            content = ""
+        return {
+            "success": True,
+            "content": content
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read proxy pool: {str(e)}")
+
+@router.post("/api/proxy/pool")
+async def update_proxy_pool(
+    request: dict,
+    token: str = Depends(verify_admin_token)
+):
+    """Update proxy pool content in data/proxy.txt"""
+    try:
+        import os
+        content = request.get("content", "")
+        proxy_file = os.path.join("data", "proxy.txt")
+
+        # Ensure data directory exists
+        os.makedirs("data", exist_ok=True)
+
+        with open(proxy_file, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        # Reload proxy pool in proxy manager
+        if proxy_manager:
+            await proxy_manager.reload_proxy_pool()
+
+        return {
+            "success": True,
+            "message": "Proxy pool updated successfully"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update proxy pool: {str(e)}")
+
+
+# Proxy pool test endpoints
+@router.post("/api/proxy/test")
+async def test_all_proxies(
+    request: dict = None,
+    token: str = Depends(verify_admin_token)
+):
+    """Test all proxies in the pool
+
+    Args:
+        remove_invalid: If True, remove invalid proxies from the pool file
+    """
+    try:
+        if not proxy_manager:
+            raise HTTPException(status_code=500, detail="Proxy manager not initialized")
+
+        remove_invalid = request.get("remove_invalid", False) if request else False
+        result = await proxy_manager.test_all_proxies(remove_invalid=remove_invalid)
+
+        return {
+            "success": True,
+            "message": f"测试完成: {result['valid']} 有效, {result['invalid']} 无效" +
+                      (f", 已移除 {result['removed']} 个无效代理" if result['removed'] > 0 else ""),
+            **result
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to test proxies: {str(e)}")
+
+@router.post("/api/proxy/test-single")
+async def test_single_proxy(
+    request: dict,
+    token: str = Depends(verify_admin_token)
+):
+    """Test a single proxy"""
+    try:
+        if not proxy_manager:
+            raise HTTPException(status_code=500, detail="Proxy manager not initialized")
+
+        proxy_url = request.get("proxy_url")
+        if not proxy_url:
+            raise HTTPException(status_code=400, detail="proxy_url is required")
+
+        result = await proxy_manager.test_single_proxy(proxy_url)
+
+        return {
+            "success": True,
+            **result
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to test proxy: {str(e)}")
