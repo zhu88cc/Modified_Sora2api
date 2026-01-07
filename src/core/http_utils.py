@@ -100,7 +100,6 @@ def build_sora_headers(
         "Authorization": f"Bearer {token}",
         "User-Agent": user_agent or get_random_user_agent(),
         "oai-device-id": device_id or generate_device_id(),
-        "oai-language": "en-US",
     }
     
     if content_type:
