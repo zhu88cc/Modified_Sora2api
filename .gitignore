@@ -48,7 +48,7 @@ Thumbs.db
 # Environment
 .env
 .env.local
-
+.logs.txt
 # Reference projects
 sora2api-main/
 sora2api/
@@ -59,3 +59,4 @@ new-api/
 sora2api-main/.env
 # Test files
 test_concurrent.py
+openai_sentinel_token.py

@@ -75,13 +75,3 @@ custom_parse_token = ""
 [token_refresh]
 at_auto_refresh_enabled = false
 
-[cloudflare]
-# Cloudflare Solver API 配置
-# 当检测到 429 Cloudflare challenge 时，自动请求此 API 获取 cf_clearance
-enabled = true
-api_url = "http://64.23.171.147:8005"
-api_key = ""
-# 全局模式：对所有请求使用 CF 凭据
-global_enabled = false
-# API-only 模式：仅对 API 请求使用 CF 凭据
-api_only_enabled = true

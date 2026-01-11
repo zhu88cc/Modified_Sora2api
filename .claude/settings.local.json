@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python -c \"\nfrom src.services.proxy_manager import ProxyManager\n\n# 模拟解析\npm = ProxyManager\\(None\\)\ntest_proxy = ''socks5h://sp2hcpv7fv:o20evPAx0~FmwvXaf3@dc.decodo.com:10001''\nresult = pm._parse_proxy_line\\(test_proxy\\)\nprint\\(f''Input: {test_proxy}''\\)\nprint\\(f''Parsed: {result}''\\)\n\")",
-      "Bash(python -c \"\nfrom src.services.proxy_manager import ProxyManager\n\n# 模拟解析\npm = ProxyManager\\(None\\)\ntest_proxy = ''socks5h://sp2hcpv7fv:o20evPAx0~FmwvXaf3@dc.decodo.com:10001''\nresult = pm._parse_proxy_line\\(test_proxy\\)\nprint\\(f''Input: {test_proxy}''\\)\nprint\\(f''Parsed: {result}''\\)\nprint\\(\\)\n\n# 测试其他格式\ntest_cases = [\n    ''socks5h://sp2hcpv7fv:o20evPAx0~FmwvXaf3@dc.decodo.com:10001'',\n    ''socks5://user:pass@host:port'',\n    ''st5 host:port:user:pass'',\n    ''ST5 host:port:user:pass'',\n]\nfor tc in test_cases:\n    result = pm._parse_proxy_line\\(tc\\)\n    print\\(f''{tc} -> {result}''\\)\n\")"
-    ]
-  }
-}
