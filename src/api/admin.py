@@ -1448,6 +1448,9 @@ async def update_lambda_config(
             lambda_api_key=request.lambda_api_key
         )
 
+        from ..services.lambda_manager import lambda_manager
+        lambda_manager.invalidate_cache()
+
         return {"success": True, "message": "Lambda configuration updated"}
     except HTTPException:
         raise

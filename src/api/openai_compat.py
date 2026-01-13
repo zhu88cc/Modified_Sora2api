@@ -997,13 +997,16 @@ async def create_video(
         if async_mode:
             from ..core.database import Database
             from ..core.models import Task
+            from ..services.lambda_manager import lambda_manager
 
             db = Database()
-            lambda_config = await db.get_lambda_config()
+            lambda_enabled = await lambda_manager.is_enabled()
+            lambda_urls = await lambda_manager.get_all_urls()
+            lambda_key = await lambda_manager.get_api_key()
             can_use_lambda = (
-                lambda_config.lambda_enabled
-                and lambda_config.lambda_api_url
-                and lambda_config.lambda_api_key
+                lambda_enabled
+                and lambda_urls
+                and lambda_key
                 and not remix_target_id
                 and not generation_handler.sora_client.is_storyboard_prompt(prompt)
             )
@@ -1038,9 +1041,7 @@ async def create_video(
                         size=model_config.get("size", "small")
                     )
 
-                    task_id = await _post_lambda_create_task(
-                        lambda_url=lambda_config.lambda_api_url,
-                        lambda_key=lambda_config.lambda_api_key,
+                    task_id = await lambda_manager.create_task(
                         token=token_obj.token,
                         payload=payload
                     )
