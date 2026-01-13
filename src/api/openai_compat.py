@@ -364,6 +364,13 @@ async def create_chat_completion(
         )
 
 
+def _strip_markdown_wrapped_paren(url: str, content: str, start_index: int) -> str:
+    """Remove trailing ')' from Markdown-wrapped URLs like (...)."""
+    if url.endswith(")") and start_index > 0 and content[start_index - 1] == "(":
+        return url[:-1]
+    return url
+
+
 def _extract_url_from_chunks(chunks_data: list) -> Optional[str]:
     """Extract URL from streaming chunks"""
     for chunk in chunks_data:
@@ -378,7 +385,9 @@ def _extract_url_from_chunks(chunks_data: list) -> Optional[str]:
                     if content:
                         url_match = re.search(r'https?://[^\s\]"\']+', content)
                         if url_match:
-                            return url_match.group(0)
+                            return _strip_markdown_wrapped_paren(
+                                url_match.group(0), content, url_match.start()
+                            )
             except Exception:
                 pass
     return None
@@ -422,7 +431,10 @@ def _extract_video_info_from_chunks(chunks_data: list) -> dict:
                 # Fallback: extract by regex
                 url_match = re.search(r'https?://[^\s\]"\']+', content)
                 if url_match:
-                    return {"url": url_match.group(0), "permalink": None}
+                    url = _strip_markdown_wrapped_paren(
+                        url_match.group(0), content, url_match.start()
+                    )
+                    return {"url": url, "permalink": None}
             except Exception:
                 pass
     return {}
